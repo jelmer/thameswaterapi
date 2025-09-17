@@ -208,9 +208,14 @@ class ThamesWater:
         self._get_oauth2_code_b2c_1_tw_website_signin(confirmation_code)
         self._refresh_oauth2_token_b2c_1_tw_website_signin()
 
+        headers = {
+            'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+            'Referer': 'https://myaccount.thameswater.co.uk/twservice/Account/SignIn?useremail=',
+        }
+
         self.s.get('https://myaccount.thameswater.co.uk/mydashboard')
         self.s.get(f'https://myaccount.thameswater.co.uk/mydashboard/my-meters-usage?contractAccountNumber={self.account_number}')
-        r = self.s.get('https://myaccount.thameswater.co.uk/twservice/Account/SignIn?useremail=')
+        r = self.s.get('https://myaccount.thameswater.co.uk/twservice/Account/SignIn?useremail=', headers=headers)
         state = r.url.split('&state=')[1].split('&nonce=')[0].replace('%3d', '=')
         id_token = r.text.split("id='id_token' value='")[1].split("'/>")[0]
         self.s.get(r.url)
