@@ -1,10 +1,12 @@
 [tool.poetry]
-name = "thameswaterclient"
-version = "0.1.5"
+name = "thameswaterapi"
+version = "0.2.0"
 description = "A Python client for retrieving hourly meter data from Thames Water"
 authors = ["Ayrton Bourn <ayrtonbourn@outlook.com>"]
+maintainers = ["Jelmer Vernooĳ <jelmer@jelmer.uk>"]
 license = "MIT"
 readme = "README.md"
+packages = [{include = "thameswaterapi"}]
 
 [tool.poetry.dependencies]
 python = ">=3.9,<4.0"
@@ -16,7 +18,7 @@ mypy = "^1.7.0"
 python-dotenv = "^1.0.1"
 
 [project.urls]
-Homepage = "https://github.com/AyrtonB/Thames-Water/"
+Homepage = "https://github.com/jelmer/thameswaterapi"
 
 [build-system]
 requires = ["poetry-core"]

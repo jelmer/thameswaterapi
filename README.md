@@ -1,11 +1,16 @@
-# Thames-Water
+# thameswaterapi
 
-`pip install thameswaterclient`
+`pip install thameswaterapi`
+
+A Python client for retrieving meter data from Thames Water.
+
+This is a fork of [thameswaterclient](https://github.com/AyrtonB/Thames-Water/)
+by [Ayrton Bourn](https://github.com/AyrtonB).
 
 ## Python API
 
 ```python
-from thameswaterclient import ThamesWater
+from thameswaterapi import ThamesWater
 
 email = 'myname@provider.com'
 password = '**********'
@@ -29,7 +34,7 @@ thames_water.get_meter_numbers()    # ['123456789']
 ### Daily usage
 
 ```python
-from thameswaterclient import lines_to_timeseries
+from thameswaterapi import lines_to_timeseries
 
 meters = thames_water.get_meters()
 readings = lines_to_timeseries(meters.Lines)
@@ -41,7 +46,7 @@ for r in readings:
 
 ```python
 import datetime
-from thameswaterclient import meter_usage_lines_to_timeseries
+from thameswaterapi import meter_usage_lines_to_timeseries
 
 meter = thames_water.get_meter_numbers()[0]
 start = datetime.datetime(2024, 10, 1)
@@ -56,7 +61,7 @@ for r in readings:
 ## Command line
 
 ```
-python -m thameswaterclient EMAIL PASSWORD [options]
+python -m thameswaterapi EMAIL PASSWORD [options]
 ```
 
 Options:
@@ -70,14 +75,14 @@ Examples:
 
 ```sh
 # Show daily and hourly readings for the default account and first meter
-python -m thameswaterclient myname@provider.com mypassword
+python -m thameswaterapi myname@provider.com mypassword
 
 # List available account numbers
-python -m thameswaterclient myname@provider.com mypassword --list-accounts
+python -m thameswaterapi myname@provider.com mypassword --list-accounts
 
 # List meters on a specific account
-python -m thameswaterclient myname@provider.com mypassword --account-number 123456789012 --list-meters
+python -m thameswaterapi myname@provider.com mypassword --account-number 123456789012 --list-meters
 
 # Query a specific meter
-python -m thameswaterclient myname@provider.com mypassword --meter 123456789
+python -m thameswaterapi myname@provider.com mypassword --meter 123456789
 ```

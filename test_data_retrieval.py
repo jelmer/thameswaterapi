@@ -3,7 +3,7 @@ import unittest
 
 import zoneinfo
 
-from thameswaterclient import (
+from thameswaterapi import (
     HourlyMeasurement,
     Line,
     Measurement,
@@ -112,7 +112,7 @@ class TestDeserializeMetersResponse(unittest.TestCase):
     def test_unknown_fields_ignored_with_warning(self):
         data = dict(self.SAMPLE_JSON)
         data["SomeNewField"] = "surprise"
-        with self.assertLogs("thameswaterclient", level="WARNING") as cm:
+        with self.assertLogs("thameswaterapi", level="WARNING") as cm:
             result = self._parse(data)
         self.assertFalse(result.IsError)
         self.assertIn("SomeNewField", cm.output[0])
@@ -182,7 +182,7 @@ class TestDeserializeMeterUsage(unittest.TestCase):
     def test_unknown_fields_ignored_with_warning(self):
         data = dict(self.SAMPLE_JSON)
         data["BrandNewField"] = 42
-        with self.assertLogs("thameswaterclient", level="WARNING") as cm:
+        with self.assertLogs("thameswaterapi", level="WARNING") as cm:
             result = self._parse(data)
         self.assertFalse(result.IsError)
         self.assertIn("BrandNewField", cm.output[0])

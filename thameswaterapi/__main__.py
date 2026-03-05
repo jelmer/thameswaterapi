@@ -1,13 +1,13 @@
 """Command-line interface for the Thames Water client.
 
 Usage:
-    python -m thameswaterclient EMAIL PASSWORD [--account-number N] [--list-accounts] [--list-meters] [--meter M]
+    python -m thameswaterapi EMAIL PASSWORD [--account-number N] [--list-accounts] [--list-meters] [--meter M]
 """
 
 import argparse
 import datetime
 
-from thameswaterclient import (
+from thameswaterapi import (
     ThamesWater,
     lines_to_timeseries,
     meter_usage_lines_to_timeseries,

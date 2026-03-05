@@ -2,14 +2,15 @@
 """Live integration tests for the Thames Water client.
 
 Usage:
-    python -m thameswaterclient.test_live EMAIL PASSWORD ACCOUNT_NUMBER
+    python -m thameswaterapi.test_live EMAIL PASSWORD ACCOUNT_NUMBER
 """
+
 import argparse
 import datetime
 import sys
 import unittest
 
-from thameswaterclient import (
+from thameswaterapi import (
     ThamesWater,
     lines_to_timeseries,
     meter_usage_lines_to_timeseries,
@@ -74,10 +75,14 @@ class TestLiveIntegration(unittest.TestCase):
 def main():
     global _email, _password, _account_number
 
-    parser = argparse.ArgumentParser(description="Run live Thames Water integration tests")
+    parser = argparse.ArgumentParser(
+        description="Run live Thames Water integration tests"
+    )
     parser.add_argument("email", help="Thames Water account email")
     parser.add_argument("password", help="Thames Water account password")
-    parser.add_argument("account_number", type=int, help="Thames Water contract account number")
+    parser.add_argument(
+        "account_number", type=int, help="Thames Water contract account number"
+    )
     args = parser.parse_args()
 
     _email = args.email
