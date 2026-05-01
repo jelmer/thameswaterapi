@@ -528,7 +528,7 @@ class ThamesWater:
 
         scope = (
             f"https://identity.thameswater.co.uk/{ACCOUNT_MANAGEMENT_API_RESOURCE_ID}"
-            "/.default openid profile offline_access"
+            "/default openid profile offline_access"
         )
 
         data = {
