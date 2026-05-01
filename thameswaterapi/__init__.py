@@ -64,6 +64,74 @@ class MetersResponse(MeterUsage):
 
 
 @dataclass
+class Address:
+    addressLine1: Optional[str]
+    addressLine2: Optional[str]
+    town: Optional[str]
+    administrativeArea: Optional[str]
+    country: Optional[str]
+    postcode: Optional[str]
+    fullAddress: Optional[str]
+
+
+@dataclass
+class PrimaryAccountHolder:
+    businessPartnerId: Optional[str]
+    dateOfBirth: Optional[str]
+    firstName: Optional[str]
+    secondName: Optional[str]
+    lastName: Optional[str]
+    fullName: Optional[str]
+
+
+@dataclass
+class Property:
+    propertyId: Optional[str]
+    address: Optional[Address]
+    meterType: Optional[int]
+
+
+@dataclass
+class ContactDetails:
+    primaryLandlineNumber: Optional[str]
+    primaryMobileNumber: Optional[str]
+    primaryEmail: Optional[str]
+    isPrimaryLandlineNumberValid: Optional[bool]
+    isPrimaryMobileNumberValid: Optional[bool]
+
+
+@dataclass
+class Correspondence:
+    address: Optional[Address]
+
+
+@dataclass
+class Account:
+    """Account details from the account-management-api /Accounts endpoint."""
+
+    contractAccountNumber: str
+    billingPreference: Optional[int] = None
+    moveInDate: Optional[str] = None
+    paymentDueAmount: float = 0.0
+    currentBalance: float = 0.0
+    moveOutDate: Optional[str] = None
+    primaryAccountHolder: Optional[PrimaryAccountHolder] = None
+    property: Optional[Property] = None
+    isProgressiveMeterProgram: Optional[bool] = None
+    status: Optional[int] = None
+    isMetered: Optional[bool] = None
+    isFutureMoveIn: Optional[bool] = None
+    isActiveAccount: Optional[bool] = None
+    isInCredit: Optional[bool] = None
+    dunningLock: Optional[bool] = None
+    contactDetails: Optional[ContactDetails] = None
+    isStandard: Optional[bool] = None
+    isCollective: Optional[bool] = None
+    correspondence: Optional[Correspondence] = None
+    isMovedOutStillActive: Optional[bool] = None
+
+
+@dataclass
 class Measurement:
     start: datetime.date
     usage: int  # Usage
@@ -78,6 +146,11 @@ class HourlyMeasurement:
 
 
 _logger = logging.getLogger(__name__)
+
+# Audience (resource app id) for the account-management-api. The app id is
+# specific to Thames Water and is used to scope access tokens for the
+# account-management-api host.
+ACCOUNT_MANAGEMENT_API_RESOURCE_ID = "8a63d7f3-8ff8-4be6-b4cd-c5957e68a9bb"
 
 
 def _filter_known_fields(cls: type, data: dict) -> dict:
@@ -98,6 +171,41 @@ def parse_meter_usage(data: dict) -> MeterUsage:
     data = dict(data)
     data["Lines"] = [Line(**line) for line in data["Lines"] or []]
     return MeterUsage(**_filter_known_fields(MeterUsage, data))
+
+
+def _parse_address(data: Optional[dict]) -> Optional[Address]:
+    if data is None:
+        return None
+    return Address(**_filter_known_fields(Address, data))
+
+
+def parse_account(data: dict) -> Account:
+    """Parse a raw JSON dict from the account-management-api /Accounts endpoint."""
+    data = dict(data)
+
+    if (holder := data.get("primaryAccountHolder")) is not None:
+        data["primaryAccountHolder"] = PrimaryAccountHolder(
+            **_filter_known_fields(PrimaryAccountHolder, holder)
+        )
+
+    if (prop := data.get("property")) is not None:
+        prop = dict(prop)
+        prop["address"] = _parse_address(prop.get("address"))
+        data["property"] = Property(**_filter_known_fields(Property, prop))
+
+    if (contact := data.get("contactDetails")) is not None:
+        data["contactDetails"] = ContactDetails(
+            **_filter_known_fields(ContactDetails, contact)
+        )
+
+    if (corr := data.get("correspondence")) is not None:
+        corr = dict(corr)
+        corr["address"] = _parse_address(corr.get("address"))
+        data["correspondence"] = Correspondence(
+            **_filter_known_fields(Correspondence, corr)
+        )
+
+    return Account(**_filter_known_fields(Account, data))
 
 
 def parse_meters_response(data: dict) -> MetersResponse:
@@ -412,6 +520,63 @@ class ThamesWater:
         r.raise_for_status()
 
         return parse_meter_usage(r.json())
+
+    def _acquire_account_management_api_access_token(self) -> str:
+        """Exchange the refresh token for an access token scoped to the
+        account-management-api resource."""
+        url = "https://login.thameswater.co.uk/identity.thameswater.co.uk/b2c_1_tw_website_signin/oauth2/v2.0/token"
+
+        scope = (
+            f"https://identity.thameswater.co.uk/{ACCOUNT_MANAGEMENT_API_RESOURCE_ID}"
+            "/.default openid profile offline_access"
+        )
+
+        data = {
+            "client_id": self.client_id,
+            "scope": scope,
+            "grant_type": "refresh_token",
+            "client_info": "1",
+            "x-client-SKU": "msal.js.browser",
+            "x-client-VER": "3.1.0",
+            "refresh_token": self.oauth_request_tokens["refresh_token"],
+        }
+
+        headers = {"content-type": "application/x-www-form-urlencoded;charset=utf-8"}
+
+        r = self.s.post(url, headers=headers, data=data)
+        r.raise_for_status()
+        body = r.json()
+        if "access_token" not in body:
+            raise AuthenticationError(
+                "No access_token in response from account-management-api token "
+                f"exchange. Keys: {sorted(body.keys())}"
+            )
+        return body["access_token"]
+
+    def get_account(self) -> Account:
+        """Return account details for the current contract account number.
+
+        Includes the outstanding balance (paymentDueAmount) and current
+        balance, as well as account holder, property, and contact details.
+        """
+        access_token = self._acquire_account_management_api_access_token()
+
+        url = "https://account-management-api.prod.p.webapp.thameswater.co.uk/account-management-api/Accounts"
+
+        headers = {
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+            "Accept": "text/plain",
+            "Authorization": f"Bearer {access_token}",
+            "content-type": "application/json",
+            "x-contract-account-number": str(self.account_number),
+            "Origin": "https://www.thameswater.co.uk",
+            "Referer": "https://www.thameswater.co.uk/",
+        }
+
+        r = self.s.get(url, headers=headers)
+        r.raise_for_status()
+
+        return parse_account(r.json())
 
 
 def _parse_line_label_as_date(label: str, today: datetime.date) -> datetime.date:

@@ -11,6 +11,7 @@ from thameswaterapi import (
     _parse_line_label_as_date,
     lines_to_timeseries,
     meter_usage_lines_to_timeseries,
+    parse_account,
     parse_meter_usage,
     parse_meters_response,
 )
@@ -336,6 +337,139 @@ class TestMeterUsageLinesToTimeseries(unittest.TestCase):
         result = meter_usage_lines_to_timeseries(datetime.date(2026, 2, 10), lines)
         self.assertEqual(result[0].usage, 99)
         self.assertEqual(result[0].total, 1000)
+
+
+class TestParseAccount(unittest.TestCase):
+    """Test parsing of the account-management-api /Accounts response."""
+
+    SAMPLE_JSON = {
+        "contractAccountNumber": "900000000000",
+        "billingPreference": 2,
+        "moveInDate": "2025-09-09",
+        "paymentDueAmount": 0,
+        "currentBalance": 0,
+        "moveOutDate": "9999-12-31",
+        "primaryAccountHolder": {
+            "businessPartnerId": "6000000000",
+            "dateOfBirth": "1985-06-11",
+            "firstName": "Jane",
+            "secondName": None,
+            "lastName": "Doe",
+            "fullName": "Jane Doe",
+        },
+        "property": {
+            "propertyId": "0000000000",
+            "address": {
+                "addressLine1": "1",
+                "addressLine2": "Example Street",
+                "town": "London",
+                "administrativeArea": "",
+                "country": "Gb",
+                "postcode": "AB1 2CD",
+                "fullAddress": "1, Example Street, London, AB1 2CD",
+            },
+            "meterType": 2,
+        },
+        "isProgressiveMeterProgram": False,
+        "status": 1,
+        "isMetered": True,
+        "isFutureMoveIn": False,
+        "isActiveAccount": True,
+        "isInCredit": False,
+        "dunningLock": False,
+        "contactDetails": {
+            "primaryLandlineNumber": None,
+            "primaryMobileNumber": "07000000000",
+            "primaryEmail": "jane@example.com",
+            "isPrimaryLandlineNumberValid": True,
+            "isPrimaryMobileNumberValid": True,
+        },
+        "isStandard": True,
+        "isCollective": False,
+        "correspondence": {
+            "address": {
+                "addressLine1": "1",
+                "addressLine2": "Example Street",
+                "town": "London",
+                "administrativeArea": "",
+                "country": "Gb",
+                "postcode": "AB1 2CD",
+                "fullAddress": "1, Example Street, London, AB1 2CD",
+            }
+        },
+        "isMovedOutStillActive": False,
+    }
+
+    def test_basic_fields(self):
+        result = parse_account(self.SAMPLE_JSON)
+        self.assertEqual(result.contractAccountNumber, "900000000000")
+        self.assertEqual(result.paymentDueAmount, 0)
+        self.assertEqual(result.currentBalance, 0)
+        self.assertFalse(result.isInCredit)
+        self.assertTrue(result.isMetered)
+
+    def test_outstanding_balance(self):
+        data = dict(self.SAMPLE_JSON)
+        data["paymentDueAmount"] = 42.50
+        data["currentBalance"] = 42.50
+        result = parse_account(data)
+        self.assertEqual(result.paymentDueAmount, 42.50)
+        self.assertEqual(result.currentBalance, 42.50)
+
+    def test_in_credit(self):
+        data = dict(self.SAMPLE_JSON)
+        data["currentBalance"] = -15.0
+        data["isInCredit"] = True
+        result = parse_account(data)
+        self.assertEqual(result.currentBalance, -15.0)
+        self.assertTrue(result.isInCredit)
+
+    def test_primary_account_holder(self):
+        result = parse_account(self.SAMPLE_JSON)
+        self.assertIsNotNone(result.primaryAccountHolder)
+        self.assertEqual(result.primaryAccountHolder.fullName, "Jane Doe")
+        self.assertEqual(result.primaryAccountHolder.businessPartnerId, "6000000000")
+
+    def test_property_and_address(self):
+        result = parse_account(self.SAMPLE_JSON)
+        self.assertIsNotNone(result.property)
+        self.assertEqual(result.property.propertyId, "0000000000")
+        self.assertEqual(result.property.meterType, 2)
+        self.assertIsNotNone(result.property.address)
+        self.assertEqual(result.property.address.postcode, "AB1 2CD")
+
+    def test_contact_details(self):
+        result = parse_account(self.SAMPLE_JSON)
+        self.assertIsNotNone(result.contactDetails)
+        self.assertEqual(result.contactDetails.primaryEmail, "jane@example.com")
+        self.assertEqual(result.contactDetails.primaryMobileNumber, "07000000000")
+
+    def test_correspondence_address(self):
+        result = parse_account(self.SAMPLE_JSON)
+        self.assertIsNotNone(result.correspondence)
+        self.assertIsNotNone(result.correspondence.address)
+        self.assertEqual(result.correspondence.address.postcode, "AB1 2CD")
+
+    def test_unknown_fields_ignored_with_warning(self):
+        data = dict(self.SAMPLE_JSON)
+        data["NewServerField"] = "surprise"
+        with self.assertLogs("thameswaterapi", level="WARNING") as cm:
+            result = parse_account(data)
+        self.assertEqual(result.contractAccountNumber, "900000000000")
+        self.assertIn("NewServerField", cm.output[0])
+
+    def test_missing_optional_subobjects(self):
+        data = {
+            "contractAccountNumber": "900000000000",
+            "paymentDueAmount": 0,
+            "currentBalance": 0,
+        }
+        result = parse_account(data)
+        self.assertEqual(result.contractAccountNumber, "900000000000")
+        self.assertIsNone(result.primaryAccountHolder)
+        self.assertIsNone(result.property)
+        self.assertIsNone(result.contactDetails)
+        self.assertIsNone(result.correspondence)
 
 
 if __name__ == "__main__":
