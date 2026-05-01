@@ -57,6 +57,12 @@ class TestLiveIntegration(unittest.TestCase):
             self.assertIsInstance(r.usage, int)
             self.assertIsInstance(r.total, int)
 
+    def test_get_account(self):
+        account = self.tw.get_account()
+        self.assertEqual(str(account.contractAccountNumber), str(_account_number))
+        self.assertIsInstance(account.paymentDueAmount, (int, float))
+        self.assertIsInstance(account.currentBalance, (int, float))
+
     def test_get_meter_usage_hourly(self):
         end = datetime.datetime.now() - datetime.timedelta(days=3)
         start = end - datetime.timedelta(days=1)
