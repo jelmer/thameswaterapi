@@ -1,6 +1,6 @@
 [project]
 name = "thameswaterapi"
-version = "0.2.0"
+version = "0.3.0"
 description = "A Python client for retrieving hourly meter data from Thames Water"
 authors = [
     {name = "Ayrton Bourn", email = "ayrtonbourn@outlook.com"},
