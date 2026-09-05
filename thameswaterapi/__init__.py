@@ -238,6 +238,7 @@ class Account:
     isCollective: bool | None = None
     correspondence: Correspondence | None = None
     isMovedOutStillActive: bool | None = None
+    canAccessSmartMeterGranularData: bool | None = None
 
     # builtins.property, because the field above shadows the name here.
     @builtins.property
