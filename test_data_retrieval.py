@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import datetime
+import json
 import unittest
 import zoneinfo
 from typing import ClassVar
+from unittest import mock
+
+import requests
 
 from thameswaterapi import (
+    B2C_HOST,
+    END_SESSION_ENDPOINT,
+    TOKEN_ENDPOINT,
+    AuthenticationError,
     HourlyMeasurement,
     Line,
+    MalformedResponse,
     Measurement,
     MeterType,
+    RateLimitError,
+    ThamesWater,
     _decode_jwt_payload,
     _parse_line_label_as_date,
     lines_to_timeseries,
@@ -18,6 +29,107 @@ from thameswaterapi import (
     parse_meter_usage,
     parse_meters_response,
 )
+
+
+def _response(
+    status: int = 200,
+    body: str = "{}",
+    content_type: str = "application/json",
+    headers: dict | None = None,
+) -> requests.Response:
+    r = requests.Response()
+    r.status_code = status
+    r._content = body.encode()
+    r.headers["content-type"] = content_type
+    r.headers.update(headers or {})
+    return r
+
+
+def _client(*responses: requests.Response) -> ThamesWater:
+    """A client whose session replays ``responses`` without authenticating."""
+    client = ThamesWater("user@example.com", "hunter2")
+    client.s = mock.Mock(spec=requests.Session)
+    if len(responses) == 1:
+        client.s.request.return_value = responses[0]
+    else:
+        client.s.request.side_effect = responses
+    return client
+
+
+class TestRequestClassification(unittest.TestCase):
+    """Every response either parses into its dataclass or raises."""
+
+    def test_timeout_applied(self):
+        client = _client(_response())
+        client._request("GET", "https://example.invalid/")
+        self.assertEqual(client.s.request.call_args.kwargs["timeout"], 30.0)
+
+    def test_the_session_carries_the_user_agent(self):
+        client = ThamesWater("user@example.com", "hunter2")
+        self.assertIn("Mozilla/5.0", client.s.headers["user-agent"])
+
+    def test_per_call_headers_are_passed_through_untouched(self):
+        client = _client(_response())
+        client._request("GET", "https://example.invalid/", headers={"Referer": "x"})
+        self.assertEqual(client.s.request.call_args.kwargs["headers"], {"Referer": "x"})
+
+    def test_redirect_is_not_an_error(self):
+        # The authentication chain reads codes out of Location headers.
+        client = _client(_response(status=302, headers={"Location": "https://x/#c=1"}))
+        r = client._request("GET", "https://example.invalid/", allow_redirects=False)
+        self.assertEqual(r.status_code, 302)
+
+    def test_rate_limit(self):
+        client = _client(_response(status=429, headers={"Retry-After": "120"}))
+        with self.assertRaises(RateLimitError) as cm:
+            client._request("GET", "https://example.invalid/")
+        self.assertEqual(cm.exception.retry_after, 120)
+
+    def test_rate_limit_without_usable_retry_after(self):
+        client = _client(
+            _response(
+                status=429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+            )
+        )
+        with self.assertRaises(RateLimitError) as cm:
+            client._request("GET", "https://example.invalid/")
+        self.assertIsNone(cm.exception.retry_after)
+
+    def test_non_2xx_is_malformed(self):
+        client = _client(_response(status=500, body="oops"))
+        with self.assertRaises(MalformedResponse) as cm:
+            client._request_json("GET", "https://example.invalid/", parse_meter_usage)
+        self.assertEqual(cm.exception.status_code, 500)
+        self.assertEqual(cm.exception.body, "oops")
+
+    def test_html_body_is_malformed(self):
+        # An unauthenticated AJAX call answers 403 with an HTML page.
+        client = _client(
+            _response(
+                status=403, body="<html>Forbidden</html>", content_type="text/html"
+            )
+        )
+        with self.assertRaises(MalformedResponse) as cm:
+            client._request_json("GET", "https://example.invalid/", parse_meter_usage)
+        self.assertEqual(cm.exception.content_type, "text/html")
+
+    def test_non_json_body_is_malformed(self):
+        client = _client(_response(body="not json at all"))
+        with self.assertRaises(MalformedResponse) as cm:
+            client._request_json("GET", "https://example.invalid/", parse_meter_usage)
+        self.assertIn("not JSON", str(cm.exception))
+
+    def test_missing_field_is_malformed(self):
+        client = _client(_response(body='{"Lines": []}'))
+        with self.assertRaises(MalformedResponse) as cm:
+            client._request_json("GET", "https://example.invalid/", parse_meter_usage)
+        self.assertIn("unexpected response body", str(cm.exception))
+
+    def test_body_snippet_is_truncated(self):
+        client = _client(_response(status=500, body="x" * 500))
+        with self.assertRaises(MalformedResponse) as cm:
+            client._request("GET", "https://example.invalid/")
+        self.assertEqual(len(cm.exception.body), MalformedResponse.BODY_SNIPPET_LEN)
 
 
 class TestDeserializeMetersResponse(unittest.TestCase):
@@ -210,6 +322,298 @@ class TestDecodeJwtPayload(unittest.TestCase):
         # A payload whose length is a multiple of 4 needs no padding added.
         claims = _decode_jwt_payload(self._token("eyJhYiI6IDF9"))
         self.assertEqual(claims, {"ab": 1})
+
+
+class TestLogout(unittest.TestCase):
+    def test_calls_the_end_session_endpoint(self):
+        client = _client(
+            _response(status=302, headers={"Location": "https://www.invalid/"})
+        )
+        client.logout()
+        self.assertEqual(client.s.request.call_args.args, ("GET", END_SESSION_ENDPOINT))
+
+    def test_the_next_call_establishes_a_session_again(self):
+        # The server has torn the session down, so a client still holding
+        # the flag would make its next call against a dead one.
+        client = _client(
+            _response(status=302, headers={"Location": "https://www.invalid/"})
+        )
+        client._authenticated = True
+        client._meter_page_visited = True
+
+        client.logout()
+
+        client.authenticate = mock.Mock()
+        client._ensure_session()
+        client.authenticate.assert_called_once()
+
+
+class TestRefreshTokenGrant(unittest.TestCase):
+    def _client_with_token(self, *responses):
+        client = _client(*responses)
+        client._refresh_token = "old-token"
+        return client
+
+    def test_posts_the_grant_to_the_token_endpoint(self):
+        client = self._client_with_token(
+            _response(body='{"id_token": "i", "refresh_token": "new-token"}')
+        )
+        client._refresh_token_grant()
+        method, url = client.s.request.call_args.args
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, TOKEN_ENDPOINT)
+        data = client.s.request.call_args.kwargs["data"]
+        self.assertEqual(data["grant_type"], "refresh_token")
+        self.assertEqual(data["refresh_token"], "old-token")
+
+    def test_rotated_token_is_stored(self):
+        client = self._client_with_token(
+            _response(body='{"id_token": "i", "refresh_token": "new-token"}')
+        )
+        client._refresh_token_grant()
+        self.assertEqual(client.refresh_token, "new-token")
+
+    def test_rejected_token_is_malformed_not_an_auth_failure(self):
+        # A spent or expired refresh token is a fall-through signal for the
+        # authentication ladder, never a statement about the password.
+        client = self._client_with_token(
+            _response(status=400, body='{"error": "invalid_grant"}')
+        )
+        with self.assertRaises(MalformedResponse):
+            client._refresh_token_grant()
+
+    def test_without_a_token(self):
+        client = _client(_response())
+        client._refresh_token = None
+        with self.assertRaises(ValueError):
+            client._refresh_token_grant()
+
+
+class TestAuthenticationLadder(unittest.TestCase):
+    """Each step has its own signal; none infers anything from a data call."""
+
+    ID_TOKEN = "header.eyJleHRlbnNpb25fRGVmYXVsdENvbnRyYWN0QWNjb3VudE51bWJlciI6ICI5MDAwMDAwMDAwMDAifQ.sig"
+
+    def _client_for_ladder(self, *responses):
+        client = _client(*responses)
+        client._establish_myaccount_session = mock.Mock()
+        client._visit_meter_page = mock.Mock()
+        client._authenticate_with_password = mock.Mock(return_value=self.ID_TOKEN)
+        return client
+
+    def test_refresh_token_is_tried_first(self):
+        client = self._client_for_ladder(
+            _response(
+                body=json.dumps({"id_token": self.ID_TOKEN, "refresh_token": "r2"})
+            )
+        )
+        client._refresh_token = "r1"
+        client.authenticate()
+        self.assertEqual(client.refresh_token, "r2")
+        client._authenticate_with_password.assert_not_called()
+        self.assertEqual(client.account_number, 900000000000)
+
+    def test_a_spent_refresh_token_falls_through_to_silent_authorize(self):
+        client = self._client_for_ladder(
+            _response(status=400, body='{"error": "invalid_grant"}'),
+            _response(
+                status=302,
+                headers={"Location": f"https://x/#id_token={self.ID_TOKEN}"},
+            ),
+        )
+        client._refresh_token = "spent"
+        client.authenticate()
+        client._authenticate_with_password.assert_not_called()
+
+    def test_no_live_session_falls_through_to_the_password(self):
+        client = self._client_for_ladder(
+            _response(
+                status=302,
+                headers={
+                    "Location": "https://x/#error=interaction_required"
+                    "&error_description=AADB2C90077"
+                },
+            )
+        )
+        client.authenticate()
+        client._authenticate_with_password.assert_called_once()
+
+    def test_silent_authorize_uses_prompt_none_without_following(self):
+        client = self._client_for_ladder(
+            _response(status=302, headers={"Location": "https://x/#error=x"})
+        )
+        client.authenticate()
+        call = client.s.request.call_args_list[0]
+        self.assertEqual(call.kwargs["params"]["prompt"], "none")
+        self.assertEqual(call.kwargs["params"]["response_type"], "id_token")
+        self.assertFalse(call.kwargs["allow_redirects"])
+
+    def test_an_unrecognisable_silent_authorize_answer_is_malformed(self):
+        client = self._client_for_ladder(
+            _response(status=302, headers={"Location": "https://x/"})
+        )
+        with self.assertRaises(MalformedResponse):
+            client.authenticate()
+
+    def test_a_data_call_establishes_a_session_by_itself(self):
+        client = self._client_for_ladder(
+            _response(body=json.dumps(TestDeserializeMeterUsage.SAMPLE_JSON))
+        )
+        client._refresh_token = None
+        client._authenticate_silently = mock.Mock(return_value=None)
+
+        client.get_meters()
+
+        client._authenticate_with_password.assert_called_once()
+        client._visit_meter_page.assert_called_once()
+
+    def test_a_session_serves_every_later_call(self):
+        meters = json.dumps(TestDeserializeMeterUsage.SAMPLE_JSON)
+        client = self._client_for_ladder(_response(body=meters), _response(body=meters))
+        client._refresh_token = None
+        client._authenticate_silently = mock.Mock(return_value=None)
+
+        client.get_meters()
+        client.get_meters()
+
+        # Establishing it is what the first call does; the second just uses it.
+        client._authenticate_with_password.assert_called_once()
+        self.assertEqual(client.s.request.call_count, 2)
+
+
+class TestMeterPageVisit(unittest.TestCase):
+    """The meter page is visited on a state change, not per request."""
+
+    def _authenticated_client(self, *responses):
+        client = _client(*responses)
+        client._authenticated = True
+        client._account_number = 1
+        client._meter_page_visited = True
+        return client
+
+    def test_changing_the_account_issues_nothing_by_itself(self):
+        # Assigning an attribute should not make an HTTP request.
+        client = self._authenticated_client(_response())
+        client.account_number = 2
+        client.s.request.assert_not_called()
+        self.assertFalse(client._meter_page_visited)
+
+    def test_the_next_call_rescopes_the_session(self):
+        meters = json.dumps(TestDeserializeMetersResponse.SAMPLE_JSON)
+        client = self._authenticated_client(
+            _response(body="<html>the meter page</html>"), _response(body=meters)
+        )
+        client.account_number = 2
+
+        client.get_meters()
+
+        visit = client.s.request.call_args_list[0]
+        self.assertEqual(visit.kwargs["params"], {"contractAccountNumber": 2})
+        self.assertTrue(client._meter_page_visited)
+
+    def test_setting_the_same_account_changes_nothing(self):
+        client = self._authenticated_client(_response())
+        client.account_number = 1
+        self.assertTrue(client._meter_page_visited)
+        client.s.request.assert_not_called()
+
+    def test_a_scoped_session_is_not_revisited(self):
+        meters = json.dumps(TestDeserializeMetersResponse.SAMPLE_JSON)
+        client = self._authenticated_client(_response(body=meters))
+
+        client.get_meters()
+
+        # One request: the data call, with no visit in front of it.
+        self.assertEqual(client.s.request.call_count, 1)
+
+    def test_a_failed_visit_is_retried_on_the_next_call(self):
+        meters = json.dumps(TestDeserializeMetersResponse.SAMPLE_JSON)
+        client = self._authenticated_client(
+            _response(status=500, body="nope"),
+            _response(body="<html>the meter page</html>"),
+            _response(body=meters),
+        )
+        client.account_number = 2
+
+        with self.assertRaises(MalformedResponse):
+            client.get_meters()
+        self.assertFalse(client._meter_page_visited)
+
+        client.get_meters()
+        self.assertTrue(client._meter_page_visited)
+
+    def test_get_meters_sends_no_account_number_in_the_referer(self):
+        # The session resolves the account; the header is not load-bearing.
+        client = _client(
+            _response(body=json.dumps(TestDeserializeMeterUsage.SAMPLE_JSON))
+        )
+        client._authenticated = True
+        client._account_number = 1
+        client.get_meters()
+        referer = client.s.request.call_args.kwargs["headers"]["Referer"]
+        self.assertNotIn("contractAccountNumber", referer)
+
+
+class TestSessionPersistence(unittest.TestCase):
+    def test_cookies_round_trip(self):
+        client = ThamesWater("user@example.com", "hunter2")
+        client.s.cookies.set(
+            "x-ms-cpim-trans", "abc", domain="login.thameswater.co.uk", path="/"
+        )
+        restored = ThamesWater("user@example.com", "hunter2", cookies=client.cookies)
+        self.assertEqual(restored.cookies, client.cookies)
+
+    def test_constructor_does_not_authenticate(self):
+        client = ThamesWater("user@example.com", "hunter2", refresh_token="r1")
+        self.assertEqual(client.refresh_token, "r1")
+        # Nothing has been asked for, so no session and no account number.
+        with self.assertRaises(ValueError):
+            _ = client.account_number
+
+
+class TestSelfAssertedStep(unittest.TestCase):
+    """Bad credentials must fail at the step that rejected them."""
+
+    def _sign_in(self, body: str):
+        client = _client(_response(body=body))
+        return client._self_asserted_b2c_1_tw_website_signin(
+            "user@example.com", "hunter2", "trans", "csrf"
+        )
+
+    def test_rejected_credentials_raise_with_the_server_message(self):
+        with self.assertRaises(AuthenticationError) as cm:
+            self._sign_in('{"status": "400", "message": "Your password is incorrect"}')
+        self.assertIn("Your password is incorrect", str(cm.exception))
+
+    def test_rejected_credentials_without_a_message(self):
+        with self.assertRaises(AuthenticationError):
+            self._sign_in('{"status": "400"}')
+
+    def test_accepted_credentials_return(self):
+        self._sign_in('{"status": "200"}')
+
+    def test_non_json_body_is_malformed(self):
+        with self.assertRaises(MalformedResponse):
+            self._sign_in("<html>gateway error</html>")
+
+
+class TestConfirmedStep(unittest.TestCase):
+    """The authorization code is read from the Location header, unfollowed."""
+
+    LOCATION = "https://www.thameswater.co.uk/login#code=abc123&state=s&client_info=1"
+
+    def test_reads_code_without_following(self):
+        client = _client(_response(status=302, headers={"Location": self.LOCATION}))
+        code = client._confirmed_b2c_1_tw_website_signin("trans", "csrf")
+        self.assertEqual(code, "abc123")
+        self.assertFalse(client.s.request.call_args.kwargs["allow_redirects"])
+
+    def test_missing_code_is_malformed(self):
+        client = _client(
+            _response(status=302, headers={"Location": "https://www.example.invalid/"})
+        )
+        with self.assertRaises(MalformedResponse):
+            client._confirmed_b2c_1_tw_website_signin("trans", "csrf")
 
 
 class TestParseLineLabelAsDate(unittest.TestCase):
@@ -614,6 +1018,38 @@ class TestParseAccount(unittest.TestCase):
         self.assertIsNone(result.property)
         self.assertIsNone(result.contactDetails)
         self.assertIsNone(result.correspondence)
+
+
+class TestClearingTheMyaccountSession(unittest.TestCase):
+    """A session is signed out before another is established over it."""
+
+    def _client(self) -> ThamesWater:
+        client = ThamesWater("user@example.com", "hunter2")
+        client.s.cookies.set(
+            "session", "s", domain="myaccount.thameswater.co.uk", path="/"
+        )
+        client.s.cookies.set("picker", "p", domain="www.thameswater.co.uk", path="/")
+        client.s.cookies.set("shared", "x", domain=".thameswater.co.uk", path="/")
+        client.s.cookies.set("b2cAuthenticated", "true")
+        client.s.cookies.set("b2c", "y", domain=B2C_HOST, path="/")
+        return client
+
+    def test_every_cookie_the_site_reads_goes(self):
+        client = self._client()
+        client._clear_myaccount_cookies()
+        self.assertNotIn("session", client.s.cookies)
+        self.assertNotIn("picker", client.s.cookies)
+        # Set on the registered domain, so the site reads it too.
+        self.assertNotIn("shared", client.s.cookies)
+        # No domain at all, so it goes to every host.
+        self.assertNotIn("b2cAuthenticated", client.s.cookies)
+
+    def test_the_b2c_session_survives(self):
+        # The silent step authorizes against it, and it is a different
+        # session from the one being replaced.
+        client = self._client()
+        client._clear_myaccount_cookies()
+        self.assertEqual(client.s.cookies.get("b2c", domain=B2C_HOST), "y")
 
 
 if __name__ == "__main__":

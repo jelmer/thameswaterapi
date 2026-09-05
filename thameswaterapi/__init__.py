@@ -11,8 +11,9 @@ import os
 import re
 import uuid
 import zoneinfo
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Literal
+from typing import Literal, TypeVar
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
@@ -24,6 +25,79 @@ class AuthenticationError(Exception):
 
 class TariffError(Exception):
     """Raised when the tariff page cannot be fetched or parsed."""
+
+
+class RateLimitError(Exception):
+    """Raised when Thames Water responds 429."""
+
+    def __init__(self, retry_after: int | None = None):
+        #: Seconds to wait, when the Retry-After header gave a delay in
+        #: seconds. None when the header was absent or in HTTP-date form.
+        self.retry_after = retry_after
+        super().__init__(
+            "Rate limited by Thames Water"
+            + (f"; retry after {retry_after}s" if retry_after is not None else "")
+        )
+
+
+class MalformedResponse(Exception):
+    """Raised when a response is not what the endpoint is supposed to return.
+
+    Covers a non-2xx status, a non-JSON body, an HTML error page, and JSON
+    whose shape does not match the expected dataclass, as one class. It is
+    never retried and never triggers re-authentication: the caller decides.
+    """
+
+    #: How much of the body to attach, enough to identify what came back.
+    BODY_SNIPPET_LEN = 200
+
+    def __init__(self, response: requests.Response, reason: str):
+        self.status_code = response.status_code
+        self.content_type = response.headers.get("content-type", "")
+        self.body = response.text[: self.BODY_SNIPPET_LEN]
+        super().__init__(
+            f"{reason} (HTTP {self.status_code}, content-type "
+            f"{self.content_type!r}, body starts {self.body!r})"
+        )
+
+
+#: requests has no default timeout of its own, so every call sets one.
+DEFAULT_TIMEOUT = 30.0
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+)
+
+
+B2C_USER_FLOW_URL = (
+    "https://login.thameswater.co.uk/identity.thameswater.co.uk/"
+    "b2c_1_tw_website_signin/oauth2/v2.0"
+)
+AUTHORIZATION_ENDPOINT = f"{B2C_USER_FLOW_URL}/authorize"
+TOKEN_ENDPOINT = f"{B2C_USER_FLOW_URL}/token"
+END_SESSION_ENDPOINT = f"{B2C_USER_FLOW_URL}/logout"
+
+
+MYACCOUNT_URL = "https://myaccount.thameswater.co.uk"
+LOGIN_URL = f"{MYACCOUNT_URL}/login"
+#: Hosts carrying the myaccount session. The B2C host is a sibling under the
+#: same registered domain, and its cookies outlive that session.
+SESSION_HOSTS = ("myaccount.thameswater.co.uk", "www.thameswater.co.uk")
+B2C_HOST = "login.thameswater.co.uk"
+#: Visiting this scopes the session to a contract account, and the AJAX
+#: endpoints below name it as their Referer.
+METER_PAGE_URL = f"{MYACCOUNT_URL}/mydashboard/my-meters-usage"
+GET_METERS_URL = f"{MYACCOUNT_URL}/ajax/waterMeter/getMeters"
+METER_USAGE_URL = f"{MYACCOUNT_URL}/ajax/waterMeter/getSmartWaterMeterConsumptions"
+
+#: What the site's own JavaScript sends on those endpoints.
+AJAX_HEADERS = {
+    "Referer": METER_PAGE_URL,
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+FORM_HEADERS = {"content-type": "application/x-www-form-urlencoded"}
 
 
 # Public help page carrying the current metered-household Scheme of Charges.
@@ -176,6 +250,16 @@ class Account:
 
 
 @dataclass
+class TokenResponse:
+    """A B2C token endpoint response, limited to the fields anything reads."""
+
+    id_token: str | None = None
+    access_token: str | None = None
+    refresh_token: str | None = None
+    expires_in: int | None = None
+
+
+@dataclass
 class Tariff:
     """Metered-household tariff for the Thames Water region.
 
@@ -230,10 +314,23 @@ LONDON = zoneinfo.ZoneInfo("Europe/London")
 
 _logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 # Audience (resource app id) for the account-management-api. The app id is
 # specific to Thames Water and is used to scope access tokens for the
 # account-management-api host.
 ACCOUNT_MANAGEMENT_API_RESOURCE_ID = "8a63d7f3-8ff8-4be6-b4cd-c5957e68a9bb"
+
+
+def _parse_retry_after(header: str | None) -> int | None:
+    """Return the Retry-After delay in seconds, or None if not in that form."""
+    if header is None:
+        return None
+    try:
+        return int(header)
+    except ValueError:
+        # The HTTP-date form is legal but has never been observed here.
+        return None
 
 
 def _filter_known_fields(cls: type, data: dict) -> dict:
@@ -254,6 +351,56 @@ def parse_meter_usage(data: dict) -> MeterUsage:
     data = dict(data)
     data["Lines"] = [Line(**line) for line in data["Lines"] or []]
     return MeterUsage(**_filter_known_fields(MeterUsage, data))
+
+
+def parse_token_response(data: dict) -> TokenResponse:
+    """Parse a token endpoint response.
+
+    The endpoint returns a dozen MSAL telemetry and client_info fields that
+    nothing here reads, so the wanted ones are picked out rather than filtered.
+    """
+    if "error" in data:
+        raise ValueError(
+            f"token endpoint returned {data['error']}: "
+            f"{str(data.get('error_description', ''))[:200]}"
+        )
+    return TokenResponse(
+        id_token=data.get("id_token"),
+        access_token=data.get("access_token"),
+        refresh_token=data.get("refresh_token"),
+        expires_in=data.get("expires_in"),
+    )
+
+
+def _parse_self_asserted_response(data: dict) -> None:
+    """Raise :class:`AuthenticationError` if the credentials were rejected.
+
+    B2C answers a rejected credential with HTTP 200 and a body whose own
+    status field carries the failure, so nothing in the transport layer sees
+    it and it would otherwise surface several requests later as a missing
+    'code' in the redirect fragment.
+    """
+    status = str(data.get("status", ""))
+    if status != "200":
+        raise AuthenticationError(
+            data.get("message") or f"the sign-in step returned status {status!r}"
+        )
+
+
+def _parse_id_token_response(data: dict) -> TokenResponse:
+    """Parse a token response that is only useful if it carries an id token."""
+    tokens = parse_token_response(data)
+    if tokens.id_token is None:
+        raise ValueError("no id_token in the token response")
+    return tokens
+
+
+def _parse_access_token_response(data: dict) -> TokenResponse:
+    """Parse a token response that is only useful if it carries an access token."""
+    tokens = parse_token_response(data)
+    if tokens.access_token is None:
+        raise ValueError("no access_token in the token response")
+    return tokens
 
 
 def _parse_address(data: dict | None) -> Address | None:
@@ -356,7 +503,10 @@ def parse_tariff(html: str) -> Tariff:
     )
 
 
-def get_tariff(session: requests.Session | None = None) -> Tariff:
+def get_tariff(
+    session: requests.Session | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> Tariff:
     """Fetch and parse the current metered-household tariff.
 
     Needs no authentication (the figures are region-wide), so it can be called
@@ -367,11 +517,8 @@ def get_tariff(session: requests.Session | None = None) -> Tariff:
     try:
         r = getter(
             TARIFF_URL,
-            headers={
-                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
-            },
-            timeout=30,
+            headers={"user-agent": USER_AGENT},
+            timeout=timeout,
         )
         r.raise_for_status()
     except requests.RequestException as err:
@@ -393,7 +540,13 @@ def parse_meters_response(data: dict) -> MetersResponse:
 
 
 def _decode_jwt_payload(token: str) -> dict:
-    """Decode the payload of a JWT without verifying the signature."""
+    """Decode the payload of a JWT without verifying the signature.
+
+    The signature is not checked against the user flow's jwks_uri because
+    the token is fetched over TLS directly from the issuer being
+    authenticated to, and the only claims read are the caller's own account
+    numbers.
+    """
     payload = token.split(".")[1]
     # JWT payloads are base64url and carry no padding; b64decode wants it back.
     payload += "=" * (-len(payload) % 4)
@@ -407,19 +560,151 @@ class ThamesWater:
         password: str,
         account_number: int | None = None,
         client_id: str = "cedfde2d-79a7-44fd-9833-cae769640d3d",  # specific to Thames Water
+        timeout: float = DEFAULT_TIMEOUT,
+        refresh_token: str | None = None,
+        cookies: list[dict[str, str]] | None = None,
     ):
+        """Build a client. Nothing is sent until the first call.
+
+        ``refresh_token`` and ``cookies`` are session state a previous client
+        exposed through the properties of the same name. Both are optional:
+        the authentication ladder falls through whatever no longer works.
+
+        The password is kept because recovery from an expired chain has to
+        need no human — see :meth:`authenticate`.
+        """
         self.s = requests.session()
+        # Every request wants it, so the session carries it rather than each
+        # call site or the helper merging it in.
+        self.s.headers["user-agent"] = USER_AGENT
         self.client_id = client_id
+        self.timeout = timeout
+        self.email = email
+        self.password = password
+        self._refresh_token = refresh_token
+        self._id_token_claims: dict = {}
+        self._authenticated = False
+        self._account_number = account_number
+        self._meter_page_visited = False
 
-        self._authenticate(email, password)
-
-        if account_number is None:
-            account_number = int(
-                self._id_token_claims["extension_DefaultContractAccountNumber"]
+        for cookie in cookies or []:
+            self.s.cookies.set(
+                cookie["name"],
+                cookie["value"],
+                domain=cookie.get("domain", ""),
+                path=cookie.get("path", "/"),
             )
-        self.account_number = account_number
 
-        self._visit_meter_page()
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Issue a request with the client timeout and classify the outcome.
+
+        3xx is allowed through: the authentication chain reads codes and
+        tokens out of Location headers with ``allow_redirects=False``.
+        """
+        r = self.s.request(method, url, timeout=self.timeout, **kwargs)
+
+        if r.status_code == 429:
+            raise RateLimitError(_parse_retry_after(r.headers.get("Retry-After")))
+        if r.status_code >= 400:
+            raise MalformedResponse(r, "unexpected HTTP status")
+        return r
+
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        parse: Callable[[dict], T],
+        **kwargs,
+    ) -> T:
+        """Issue a request and parse the body into its expected dataclass."""
+        r = self._request(method, url, **kwargs)
+        try:
+            payload = r.json()
+        except ValueError as err:
+            raise MalformedResponse(r, "response body is not JSON") from err
+        try:
+            return parse(payload)
+        except (AttributeError, KeyError, TypeError, ValueError) as err:
+            raise MalformedResponse(r, f"unexpected response body: {err}") from err
+
+    @property
+    def refresh_token(self) -> str | None:
+        """The refresh token currently held, for a caller that persists it.
+
+        The grant rotates it on every use, so read it back after every
+        authentication and store whatever it now is.
+        """
+        return self._refresh_token
+
+    @property
+    def cookies(self) -> list[dict[str, str]]:
+        """The session cookie jar, JSON-serialisable, for a caller that
+        persists it.
+
+        Every cookie this flow sets is session-scoped, so nothing here
+        outlives the process on its own; the refresh token is what carries a
+        session across a restart.
+        """
+        return [
+            {
+                "name": cookie.name,
+                "value": cookie.value or "",
+                "domain": cookie.domain,
+                "path": cookie.path,
+            }
+            for cookie in self.s.cookies
+        ]
+
+    @property
+    def account_number(self) -> int:
+        """The contract account number the session is scoped to.
+
+        Known once a session exists, because the ID token names the default
+        one; every data call establishes a session before reading this.
+        """
+        if self._account_number is None:
+            raise ValueError("the account number is not known without a session")
+        return self._account_number
+
+    @account_number.setter
+    def account_number(self, value: int) -> None:
+        if value == self._account_number:
+            return
+        self._account_number = value
+        # The meter page scoped the session to the account it was visited
+        # for, so it has to be visited again before the next call.
+        self._meter_page_visited = False
+
+    def _ensure_session(self) -> None:
+        """Establish a session, and scope it, if that has not happened yet.
+
+        Every data call starts here, so a session is always established
+        before a call rather than in response to one failing. A visit that
+        failed leaves the flag false, so the next call tries again.
+        """
+        if not self._authenticated:
+            self.authenticate()
+        elif not self._meter_page_visited:
+            self._visit_meter_page()
+
+    def _store_tokens(self, tokens: TokenResponse) -> None:
+        """Keep the rotated refresh token; the previous one is spent."""
+        if tokens.refresh_token is not None:
+            self._refresh_token = tokens.refresh_token
+
+    def logout(self) -> None:
+        """End the B2C session.
+
+        The response is a redirect to the post-logout page, which nothing
+        reads; only the server-side session teardown matters.
+
+        The client forgets that it had a session afterwards, so a later data
+        call climbs the ladder again rather than making the call against a
+        session the server has already torn down.
+        """
+        self._request("GET", END_SESSION_ENDPOINT, allow_redirects=False)
+        self._authenticated = False
+        self._meter_page_visited = False
 
     def _generate_pkce(self):
         self.pkce_verifier = (
@@ -434,8 +719,6 @@ class ThamesWater:
         )
 
     def _authorize_b2c_1_tw_website_signin(self) -> tuple[str, str]:
-        url = "https://login.thameswater.co.uk/identity.thameswater.co.uk/b2c_1_tw_website_signin/oauth2/v2.0/authorize"
-
         params = {
             "client_id": self.client_id,
             "scope": "openid profile offline_access",
@@ -448,11 +731,15 @@ class ThamesWater:
             "state": str(uuid.uuid4()),
         }
 
-        r = self.s.get(url, params=params)
-        r.raise_for_status()
-        return dict(self.s.cookies)["x-ms-cpim-trans"], dict(self.s.cookies)[
-            "x-ms-cpim-csrf"
-        ]
+        r = self._request("GET", AUTHORIZATION_ENDPOINT, params=params)
+
+        cookies = dict(self.s.cookies)
+        try:
+            return cookies["x-ms-cpim-trans"], cookies["x-ms-cpim-csrf"]
+        except KeyError as err:
+            raise MalformedResponse(
+                r, f"the authorize response set no {err} cookie"
+            ) from err
 
     def _self_asserted_b2c_1_tw_website_signin(
         self, email: str, password: str, trans_token: str, csrf_token: str
@@ -466,47 +753,46 @@ class ThamesWater:
 
         data = {"request_type": "RESPONSE", "email": email, "password": password}
 
-        headers = {
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-            "x-csrf-token": csrf_token,
-        }
-
-        r = self.s.post(url, params=params, data=data, headers=headers)
-        r.raise_for_status()
+        self._request_json(
+            "POST",
+            url,
+            _parse_self_asserted_response,
+            params=params,
+            data=data,
+            headers={"x-csrf-token": csrf_token},
+        )
 
     def _confirmed_b2c_1_tw_website_signin(self, trans_token: str, csrf_token: str):
         url = "https://login.thameswater.co.uk/identity.thameswater.co.uk/B2C_1_tw_website_signin/api/CombinedSigninAndSignup/confirmed"
 
-        headers = {
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
-        }
-
         params = {
+            # Explicitly false: KMSI is not enabled on this user flow today,
+            # so the flag is inert, but a true would silently start issuing a
+            # persistent SSO cookie if Thames Water ever enabled it.
             "rememberMe": "false",
             "tx": f"StateProperties={trans_token}",
             "csrf_token": csrf_token,
             "p": "B2C_1_tw_website_signin",
         }
 
-        r = self.s.get(url, headers=headers, params=params)
-        r.raise_for_status()
+        # /confirmed emits a single hop carrying the code, and the reply URL
+        # it points at is a page whose body nothing reads, so do not follow it.
+        r = self._request("GET", url, params=params, allow_redirects=False)
 
-        parsed = urlparse(r.url)
-        fragment_params = parse_qs(parsed.fragment)
+        location = r.headers.get("Location", "")
+        fragment_params = parse_qs(urlparse(location).fragment)
         if "code" not in fragment_params:
-            raise AuthenticationError(
-                f"Authentication failed: 'code' not found in redirect URL fragment. "
-                f"URL was: {r.url!r}"
+            raise MalformedResponse(
+                r, f"no 'code' in the redirect fragment; Location was {location!r}"
             )
         return fragment_params["code"][0]
 
-    def _get_oauth2_code_b2c_1_tw_website_signin(self, confirmation_code: str):
-        url = "https://login.thameswater.co.uk/identity.thameswater.co.uk/b2c_1_tw_website_signin/oauth2/v2.0/token"
+    def _get_oauth2_code_b2c_1_tw_website_signin(
+        self, confirmation_code: str
+    ) -> TokenResponse:
+        url = TOKEN_ENDPOINT
 
-        headers = {
-            "content-type": "application/x-www-form-urlencoded;charset=utf-8",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-        }
+        headers = {"content-type": "application/x-www-form-urlencoded;charset=utf-8"}
 
         data = {
             "client_id": self.client_id,
@@ -523,16 +809,29 @@ class ThamesWater:
             "code": confirmation_code,
         }
 
-        r = self.s.post(url, headers=headers, data=data)
-        r.raise_for_status()
-        self.oauth_request_tokens = r.json()
+        tokens = self._request_json(
+            "POST", url, _parse_id_token_response, headers=headers, data=data
+        )
+        self._store_tokens(tokens)
+        return tokens
 
-    def _refresh_oauth2_token_b2c_1_tw_website_signin(self):
-        url = "https://login.thameswater.co.uk/identity.thameswater.co.uk/b2c_1_tw_website_signin/oauth2/v2.0/token"
+    def _refresh_token_grant(
+        self,
+        scope: str = "openid profile offline_access",
+        parse: Callable[[dict], TokenResponse] = parse_token_response,
+    ) -> TokenResponse:
+        """Exchange the held refresh token for fresh tokens.
+
+        The grant rotates the refresh token, so the new one is stored the
+        moment it arrives: the previous one is spent and losing the new one
+        costs a password login.
+        """
+        if self._refresh_token is None:
+            raise ValueError("no refresh token held")
 
         data = {
             "client_id": self.client_id,
-            "scope": "openid profile offline_access",
+            "scope": scope,
             "grant_type": "refresh_token",
             "client_info": "1",
             "x-client-SKU": "msal.js.browser",
@@ -540,99 +839,196 @@ class ThamesWater:
             "x-ms-lib-capability": "retry-after, h429",
             "x-client-current-telemetry": "5|61,0,,,|@azure/msal-react,2.0.3",
             "x-client-last-telemetry": "5|0|||0,0",
-            "refresh_token": self.oauth_request_tokens["refresh_token"],
+            "refresh_token": self._refresh_token,
         }
 
         headers = {"content-type": "application/x-www-form-urlencoded;charset=utf-8"}
 
-        r = self.s.get(url, headers=headers, data=data)
-        r.raise_for_status()
-        self.oauth_response_tokens = r.json()
+        tokens = self._request_json(
+            "POST", TOKEN_ENDPOINT, parse, headers=headers, data=data
+        )
+        self._store_tokens(tokens)
+        return tokens
 
     def _login(self, state: str, id_token: str):
-        url = "https://myaccount.thameswater.co.uk/login"
-
         data = {
             "state": state,
             "id_token": id_token,
         }
 
-        headers = {
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-            "content-type": "application/x-www-form-urlencoded",
+        self._request("POST", LOGIN_URL, data=data, headers=FORM_HEADERS)
+
+    def authenticate(self) -> None:
+        """Establish a session, trying each credential in turn.
+
+        1. the refresh token held, which the previous cycle rotated;
+        2. a silent authorize against a still-live B2C session;
+        3. the password.
+
+        Each step has its own signal and none infers anything from a data
+        call failing, so calls are always made against a session already
+        known to be good.
+
+        Calling this is optional: a data call establishes a session by
+        itself. Call it to replace the session at a moment of the caller's
+        choosing — a long-running client that polls on a schedule wants a
+        fresh one per cycle, and wants to persist the rotated refresh token
+        before it makes any data call.
+
+        Only the password step raises :class:`AuthenticationError`, and it
+        means the password is wrong. A spent refresh token or a dead B2C
+        session is ordinary: the ladder falls through to the next step and
+        re-establishes in the same cycle, however long the gap.
+        """
+        id_token = self._authenticate_with_refresh_token()
+        if id_token is None:
+            id_token = self._authenticate_silently()
+        if id_token is None:
+            id_token = self._authenticate_with_password()
+
+        self._id_token_claims = _decode_jwt_payload(id_token)
+        self._establish_myaccount_session(id_token)
+
+        if self._account_number is None:
+            self._account_number = int(
+                self._id_token_claims["extension_DefaultContractAccountNumber"]
+            )
+
+        self._authenticated = True
+        self._visit_meter_page()
+
+    def _authenticate_with_refresh_token(self) -> str | None:
+        """Return an id_token from the refresh grant, or None to fall through.
+
+        A rejected token is the expected answer once the 24-hour lifetime has
+        run out, so it is a fall-through rather than an error.
+        """
+        if self._refresh_token is None:
+            return None
+        try:
+            return self._refresh_token_grant(parse=_parse_id_token_response).id_token
+        except MalformedResponse as err:
+            _logger.debug("Refresh token rejected, falling through: %s", err)
+            return None
+
+    def _authenticate_silently(self) -> str | None:
+        """Return an id_token from a live B2C session, or None to fall through.
+
+        prompt=none answers with an id_token while a session cookie is still
+        live and with error=interaction_required (AADB2C90077) once it is not.
+        """
+        params = {
+            "client_id": self.client_id,
+            "scope": "openid profile",
+            "response_type": "id_token",
+            "redirect_uri": "https://www.thameswater.co.uk/login",
+            "response_mode": "fragment",
+            "prompt": "none",
+            "nonce": str(uuid.uuid4()),
+            "state": str(uuid.uuid4()),
         }
 
-        r = self.s.post(url, data=data, headers=headers)
-        r.raise_for_status()
+        r = self._request(
+            "GET", AUTHORIZATION_ENDPOINT, params=params, allow_redirects=False
+        )
 
-    def _authenticate(
-        self,
-        email: str,
-        password: str,
-    ):
+        location = r.headers.get("Location", "")
+        fragment_params = parse_qs(urlparse(location).fragment)
+        if "id_token" in fragment_params:
+            return fragment_params["id_token"][0]
+        if "error" in fragment_params:
+            _logger.debug(
+                "Silent authorize declined, falling through: %s",
+                fragment_params.get("error_description", fragment_params["error"])[0],
+            )
+            return None
+        raise MalformedResponse(
+            r,
+            "no id_token and no error in the redirect fragment; "
+            f"Location was {location!r}",
+        )
+
+    def _authenticate_with_password(self) -> str:
+        """Return an id_token from the full SelfAsserted chain."""
         self._generate_pkce()
         trans_token, csrf_token = self._authorize_b2c_1_tw_website_signin()
         self._self_asserted_b2c_1_tw_website_signin(
-            email, password, trans_token, csrf_token
+            self.email, self.password, trans_token, csrf_token
         )
         confirmation_code = self._confirmed_b2c_1_tw_website_signin(
             trans_token, csrf_token
         )
-        self._get_oauth2_code_b2c_1_tw_website_signin(confirmation_code)
-        self._refresh_oauth2_token_b2c_1_tw_website_signin()
+        tokens = self._get_oauth2_code_b2c_1_tw_website_signin(confirmation_code)
+        assert tokens.id_token is not None  # _parse_id_token_response guarantees it
+        return tokens.id_token
 
-        id_token = self.oauth_request_tokens["id_token"]
-        self._id_token_claims = _decode_jwt_payload(id_token)
+    def _establish_myaccount_session(self, id_token: str) -> None:
+        """Trade the B2C id_token for a myaccount.thameswater.co.uk session."""
+        self._clear_myaccount_cookies()
 
-        # First POST to /login with the id_token to establish a session on
-        # myaccount.thameswater.co.uk. The server redirects through
-        # /twservice/Account/SignIn and then to a second B2C authorize page
-        # that carries a new state value and contains a fresh id_token in the
-        # page body.
-        r = self.s.post(
-            "https://myaccount.thameswater.co.uk/login",
+        # The first POST redirects through /twservice/Account/SignIn and then
+        # to a second B2C authorize page that carries a new state value and a
+        # fresh id_token in its body, so this one does follow its redirects.
+        r = self._request(
+            "POST",
+            LOGIN_URL,
             data={"id_token": id_token, "state": ""},
-            headers={
-                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-                "content-type": "application/x-www-form-urlencoded",
-            },
+            headers=FORM_HEADERS,
         )
-        r.raise_for_status()
 
-        parsed = urlparse(r.url)
-        query_params = parse_qs(parsed.query)
+        query_params = parse_qs(urlparse(r.url).query)
         if "state" not in query_params:
-            raise AuthenticationError(
-                f"Authentication failed: 'state' not found in redirect URL after first login POST. "
-                f"URL was: {r.url!r}"
+            raise MalformedResponse(
+                r, f"no 'state' in the resolved login URL {r.url!r}"
             )
         state = unquote(query_params["state"][0])
         if "id='id_token' value='" not in r.text:
-            raise AuthenticationError(
-                "Authentication failed: 'id_token' not found in page after first login POST."
-            )
+            raise MalformedResponse(r, "no id_token in the login page body")
         new_id_token = r.text.split("id='id_token' value='")[1].split("'/>")[0]
 
-        # Second POST to /login with the state and id_token from the redirect page
-        # to complete the session establishment.
+        # The second POST, with the state and id_token scraped above,
+        # completes the session.
         self._login(state, new_id_token)
         self.s.cookies.set(name="b2cAuthenticated", value="true")
 
-    def _visit_meter_page(self) -> None:
-        """Visit the meters usage page to establish server-side session context.
+    def _clear_myaccount_cookies(self) -> None:
+        """Sign the site out, so a new session can be established.
 
-        This is required for the AJAX endpoints to return data rather than a 500 page.
+        The POST in :meth:`_establish_myaccount_session` resolves to the
+        account picker while a session is already live, and that URL carries
+        no ``state``, so establishing one over another fails. Cookies on the
+        B2C host survive: the silent step authorizes against that session,
+        which is not the one being replaced.
         """
-        r = self.s.get(
-            f"https://myaccount.thameswater.co.uk/mydashboard/my-meters-usage?contractAccountNumber={self.account_number}",
-            headers={
-                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-            },
+        for domain in self.s.cookies.list_domains():
+            host = domain.lstrip(".")
+            if host == B2C_HOST:
+                continue
+            # A cookie with no domain, such as the flag set above, goes to
+            # every host and so belongs to this session too.
+            if host and not any(
+                site == host or site.endswith(f".{host}") for site in SESSION_HOSTS
+            ):
+                continue
+            self.s.cookies.clear(domain)
+
+    def _visit_meter_page(self) -> None:
+        """Scope the session to the contract account by visiting its page.
+
+        It is load-bearing: without it getMeters answers with a non-JSON
+        body. It is needed once per session and again whenever the contract
+        account changes, not per request.
+        """
+        self._request(
+            "GET",
+            METER_PAGE_URL,
+            params={"contractAccountNumber": self._account_number},
         )
-        r.raise_for_status()
+        self._meter_page_visited = True
 
     def get_account_numbers(self) -> list[int]:
         """Return the list of contract account numbers available for this login."""
+        self._ensure_session()
         raw = self._id_token_claims.get("extension_AvailableContractAccounts", "")
         if not raw:
             return []
@@ -645,21 +1041,15 @@ class ThamesWater:
     def get_meters(self) -> MetersResponse:
         """Return meter list and current usage data.
 
-        This is the primary endpoint for daily consumption data.
-        The Referer header with contractAccountNumber is required by the server.
+        This is the primary endpoint for daily consumption data. The account
+        is resolved from the session, which _visit_meter_page scoped, so the
+        Referer carries no account number.
         """
-        url = "https://myaccount.thameswater.co.uk/ajax/waterMeter/getMeters"
+        self._ensure_session()
 
-        headers = {
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-            "Referer": f"https://myaccount.thameswater.co.uk/mydashboard/my-meters-usage?contractAccountNumber={self.account_number}",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-
-        r = self.s.get(url, headers=headers)
-        r.raise_for_status()
-
-        return parse_meters_response(r.json())
+        return self._request_json(
+            "GET", GET_METERS_URL, parse_meters_response, headers=AJAX_HEADERS
+        )
 
     def get_meter_usage(
         self,
@@ -668,7 +1058,7 @@ class ThamesWater:
         end: datetime.date,
         granularity: Literal["H", "D", "M"] = "H",
     ) -> MeterUsage:
-        url = "https://myaccount.thameswater.co.uk/ajax/waterMeter/getSmartWaterMeterConsumptions"
+        self._ensure_session()
 
         params = {
             "meter": meter,
@@ -683,48 +1073,25 @@ class ThamesWater:
             "isForC4C": "false",
         }
 
-        headers = {
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-            "Referer": "https://myaccount.thameswater.co.uk/mydashboard/my-meters-usage",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-
-        r = self.s.get(url, params=params, headers=headers)
-        r.raise_for_status()
-
-        return parse_meter_usage(r.json())
+        return self._request_json(
+            "GET",
+            METER_USAGE_URL,
+            parse_meter_usage,
+            params=params,
+            headers=AJAX_HEADERS,
+        )
 
     def _acquire_account_management_api_access_token(self) -> str:
         """Exchange the refresh token for an access token scoped to the
         account-management-api resource."""
-        url = "https://login.thameswater.co.uk/identity.thameswater.co.uk/b2c_1_tw_website_signin/oauth2/v2.0/token"
-
         scope = (
             f"https://identity.thameswater.co.uk/{ACCOUNT_MANAGEMENT_API_RESOURCE_ID}"
             "/default openid profile offline_access"
         )
 
-        data = {
-            "client_id": self.client_id,
-            "scope": scope,
-            "grant_type": "refresh_token",
-            "client_info": "1",
-            "x-client-SKU": "msal.js.browser",
-            "x-client-VER": "3.1.0",
-            "refresh_token": self.oauth_request_tokens["refresh_token"],
-        }
-
-        headers = {"content-type": "application/x-www-form-urlencoded;charset=utf-8"}
-
-        r = self.s.post(url, headers=headers, data=data)
-        r.raise_for_status()
-        body = r.json()
-        if "access_token" not in body:
-            raise AuthenticationError(
-                "No access_token in response from account-management-api token "
-                f"exchange. Keys: {sorted(body.keys())}"
-            )
-        return body["access_token"]
+        tokens = self._refresh_token_grant(scope, _parse_access_token_response)
+        assert tokens.access_token is not None  # the parser guarantees it
+        return tokens.access_token
 
     def get_account(self) -> Account:
         """Return account details for the current contract account number.
@@ -732,12 +1099,13 @@ class ThamesWater:
         Includes the outstanding balance (paymentDueAmount) and current
         balance, as well as account holder, property, and contact details.
         """
+        self._ensure_session()
+
         access_token = self._acquire_account_management_api_access_token()
 
         url = "https://account-management-api.prod.p.webapp.thameswater.co.uk/account-management-api/Accounts"
 
         headers = {
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
             "Accept": "text/plain",
             "Authorization": f"Bearer {access_token}",
             "content-type": "application/json",
@@ -746,10 +1114,7 @@ class ThamesWater:
             "Referer": "https://www.thameswater.co.uk/",
         }
 
-        r = self.s.get(url, headers=headers)
-        r.raise_for_status()
-
-        return parse_account(r.json())
+        return self._request_json("GET", url, parse_account, headers=headers)
 
     def get_tariff(self) -> Tariff:
         """Return the current metered-household tariff for the region.
@@ -758,7 +1123,7 @@ class ThamesWater:
         client's session for convenience. See the module-level
         :func:`get_tariff` for a credential-free alternative.
         """
-        return get_tariff(self.s)
+        return get_tariff(self.s, timeout=self.timeout)
 
 
 def _parse_line_label_as_date(label: str, today: datetime.date) -> datetime.date:

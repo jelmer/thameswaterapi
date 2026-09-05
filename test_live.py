@@ -34,6 +34,7 @@ class TestLiveIntegration(unittest.TestCase):
             password=_password,
             account_number=_account_number,
         )
+        cls.tw.authenticate()
         cls.meters = cls.tw.get_meters()
         cls.meter = cls.meters.Meters[0]
 
@@ -63,6 +64,20 @@ class TestLiveIntegration(unittest.TestCase):
         self.assertEqual(str(account.contractAccountNumber), str(_account_number))
         self.assertIsInstance(account.paymentDueAmount, (int, float))
         self.assertIsInstance(account.currentBalance, (int, float))
+
+    def test_reauthenticating_with_the_rotated_refresh_token(self):
+        # The steady state: a second client authenticates off the token the
+        # first one rotated, without the password being submitted again.
+        self.assertIsNotNone(self.tw.refresh_token)
+        second = ThamesWater(
+            email=_email,
+            password="wrong-on-purpose",
+            account_number=_account_number,
+            refresh_token=self.tw.refresh_token,
+            cookies=self.tw.cookies,
+        )
+        second.authenticate()
+        self.assertGreater(len(second.get_meters().Meters), 0)
 
     def test_get_meter_usage_hourly(self):
         day = datetime.datetime.now(

@@ -24,6 +24,39 @@ If you have multiple accounts, you can specify which one to use:
 thames_water = ThamesWater(email=email, password=password, account_number=123456789)
 ```
 
+### Sessions
+
+The first data call establishes a session, by trying the refresh token the
+client holds, then a silent authorize against a live sign-in session, then the
+password. Only the password step raises `AuthenticationError`, and it means the
+password is wrong — a spent refresh token or a dead session simply falls
+through to the next step. A session is always established before a call, never
+in response to one failing.
+
+`authenticate()` does the same thing at a moment of your choosing, replacing
+whatever session is there. A long-running client wants that: it can establish
+the session where it belongs in its cycle, and store the rotated refresh token
+before making any data call.
+
+The refresh token lasts 24 hours and the grant rotates it, so a caller that
+persists it and polls more often than that submits the password only on the
+first run and after a gap longer than a day:
+
+```python
+thames_water = ThamesWater(
+    email=email,
+    password=password,
+    refresh_token=stored_refresh_token,  # from a previous client, optional
+    cookies=stored_cookies,  # likewise, optional
+)
+thames_water.authenticate()
+
+store(thames_water.refresh_token)  # rotated, so store it after every cycle
+store(thames_water.cookies)
+
+thames_water.logout()  # ends the session server-side
+```
+
 ### Listing accounts and meters
 
 ```python
