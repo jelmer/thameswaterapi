@@ -882,20 +882,32 @@ class ThamesWater:
         means the password is wrong. A spent refresh token or a dead B2C
         session is ordinary: the ladder falls through to the next step and
         re-establishes in the same cycle, however long the gap.
+
+        The refresh token outlives the B2C session, and the myaccount sign-in
+        passes through B2C, so an id_token from the refresh grant can still
+        fail to establish a session. That falls through as well; a session
+        the password step cannot establish is still an error.
         """
         # Establishing a session signs the old one out, so a failure part-way
         # must not leave a data call assuming one.
         self._authenticated = False
         self._meter_page_visited = False
 
-        id_token = self._authenticate_with_refresh_token()
-        if id_token is None:
-            id_token = self._authenticate_silently()
-        if id_token is None:
-            id_token = self._authenticate_with_password()
-
-        self._id_token_claims = _decode_jwt_payload(id_token)
-        self._establish_myaccount_session(id_token)
+        for name, step in (
+            ("refresh token", self._authenticate_with_refresh_token),
+            ("silent authorize", self._authenticate_silently),
+        ):
+            id_token = step()
+            if id_token is None:
+                continue
+            try:
+                self._establish_session(id_token)
+            except MalformedResponse as err:
+                _logger.debug("No session from the %s, falling through: %s", name, err)
+                continue
+            break
+        else:
+            self._establish_session(self._authenticate_with_password())
 
         if self._account_number is None:
             self._account_number = int(
@@ -904,6 +916,11 @@ class ThamesWater:
 
         self._authenticated = True
         self._visit_meter_page()
+
+    def _establish_session(self, id_token: str) -> None:
+        """Establish the myaccount session for an id_token from the ladder."""
+        self._id_token_claims = _decode_jwt_payload(id_token)
+        self._establish_myaccount_session(id_token)
 
     def _authenticate_with_refresh_token(self) -> str | None:
         """Return an id_token from the refresh grant, or None to fall through.

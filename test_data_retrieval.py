@@ -472,6 +472,48 @@ class TestAuthenticationLadder(unittest.TestCase):
         client._ensure_session()
         client.authenticate.assert_called_once()
 
+    def test_a_session_the_refresh_token_cannot_establish_falls_through(self):
+        # The refresh token outlives the B2C session that the myaccount
+        # sign-in passes through.
+        client = self._client_for_ladder(
+            _response(
+                body=json.dumps({"id_token": self.ID_TOKEN, "refresh_token": "r2"})
+            ),
+            _response(status=302, headers={"Location": "https://x/#error=x"}),
+        )
+        client._refresh_token = "r1"
+        client._establish_myaccount_session.side_effect = [
+            MalformedResponse(_response(), "no id_token in the login page body"),
+            None,
+        ]
+        client.authenticate()
+        client._authenticate_with_password.assert_called_once()
+        self.assertEqual(client._establish_myaccount_session.call_count, 2)
+
+    def test_a_session_silent_authorize_cannot_establish_falls_through(self):
+        client = self._client_for_ladder(
+            _response(
+                status=302,
+                headers={"Location": f"https://x/#id_token={self.ID_TOKEN}"},
+            )
+        )
+        client._establish_myaccount_session.side_effect = [
+            MalformedResponse(_response(), "no id_token in the login page body"),
+            None,
+        ]
+        client.authenticate()
+        client._authenticate_with_password.assert_called_once()
+
+    def test_a_session_the_password_cannot_establish_is_an_error(self):
+        client = self._client_for_ladder(
+            _response(status=302, headers={"Location": "https://x/#error=x"})
+        )
+        client._establish_myaccount_session.side_effect = MalformedResponse(
+            _response(), "no id_token in the login page body"
+        )
+        with self.assertRaises(MalformedResponse):
+            client.authenticate()
+
     def test_a_data_call_establishes_a_session_by_itself(self):
         client = self._client_for_ladder(
             _response(body=json.dumps(TestDeserializeMeterUsage.SAMPLE_JSON))
