@@ -883,6 +883,11 @@ class ThamesWater:
         session is ordinary: the ladder falls through to the next step and
         re-establishes in the same cycle, however long the gap.
         """
+        # Establishing a session signs the old one out, so a failure part-way
+        # must not leave a data call assuming one.
+        self._authenticated = False
+        self._meter_page_visited = False
+
         id_token = self._authenticate_with_refresh_token()
         if id_token is None:
             id_token = self._authenticate_silently()

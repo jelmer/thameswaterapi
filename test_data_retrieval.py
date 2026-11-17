@@ -455,6 +455,23 @@ class TestAuthenticationLadder(unittest.TestCase):
         with self.assertRaises(MalformedResponse):
             client.authenticate()
 
+    def test_a_failed_sign_in_leaves_no_session_behind(self):
+        client = self._client_for_ladder(
+            _response(status=302, headers={"Location": "https://x/#error=x"})
+        )
+        client._authenticated = True
+        client._meter_page_visited = True
+        client._establish_myaccount_session.side_effect = MalformedResponse(
+            _response(), "no id_token in the login page body"
+        )
+
+        with self.assertRaises(MalformedResponse):
+            client.authenticate()
+
+        client.authenticate = mock.Mock()
+        client._ensure_session()
+        client.authenticate.assert_called_once()
+
     def test_a_data_call_establishes_a_session_by_itself(self):
         client = self._client_for_ladder(
             _response(body=json.dumps(TestDeserializeMeterUsage.SAMPLE_JSON))
