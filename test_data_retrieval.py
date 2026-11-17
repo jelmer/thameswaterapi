@@ -20,6 +20,7 @@ from thameswaterapi import (
     Measurement,
     MeterType,
     RateLimitError,
+    SessionNotEstablished,
     ThamesWater,
     _decode_jwt_payload,
     _parse_line_label_as_date,
@@ -473,8 +474,6 @@ class TestAuthenticationLadder(unittest.TestCase):
         client.authenticate.assert_called_once()
 
     def test_a_session_the_refresh_token_cannot_establish_falls_through(self):
-        # The refresh token outlives the B2C session that the myaccount
-        # sign-in passes through.
         client = self._client_for_ladder(
             _response(
                 body=json.dumps({"id_token": self.ID_TOKEN, "refresh_token": "r2"})
@@ -483,7 +482,7 @@ class TestAuthenticationLadder(unittest.TestCase):
         )
         client._refresh_token = "r1"
         client._establish_myaccount_session.side_effect = [
-            MalformedResponse(_response(), "no id_token in the login page body"),
+            SessionNotEstablished(_response(), "no id_token in the login page body"),
             None,
         ]
         client.authenticate()
@@ -498,7 +497,7 @@ class TestAuthenticationLadder(unittest.TestCase):
             )
         )
         client._establish_myaccount_session.side_effect = [
-            MalformedResponse(_response(), "no id_token in the login page body"),
+            SessionNotEstablished(_response(), "no id_token in the login page body"),
             None,
         ]
         client.authenticate()
@@ -508,11 +507,46 @@ class TestAuthenticationLadder(unittest.TestCase):
         client = self._client_for_ladder(
             _response(status=302, headers={"Location": "https://x/#error=x"})
         )
-        client._establish_myaccount_session.side_effect = MalformedResponse(
+        client._establish_myaccount_session.side_effect = SessionNotEstablished(
             _response(), "no id_token in the login page body"
+        )
+        with self.assertRaises(SessionNotEstablished):
+            client.authenticate()
+
+    def test_any_other_malformed_session_answer_is_an_error(self):
+        client = self._client_for_ladder(
+            _response(
+                body=json.dumps({"id_token": self.ID_TOKEN, "refresh_token": "r2"})
+            )
+        )
+        client._refresh_token = "r1"
+        client._establish_myaccount_session.side_effect = MalformedResponse(
+            _response(), "no 'state' in the resolved login URL"
         )
         with self.assertRaises(MalformedResponse):
             client.authenticate()
+        client._authenticate_with_password.assert_not_called()
+
+    def _login_page_without_an_id_token(self, url):
+        client = _client(_response(body="<html></html>", content_type="text/html"))
+        client.s.request.return_value.url = url
+        client._clear_myaccount_cookies = mock.Mock()
+        return client
+
+    def test_the_b2c_sign_in_page_means_no_session(self):
+        client = self._login_page_without_an_id_token(
+            f"https://{B2C_HOST}/oauth2/v2.0/authorize?state=s"
+        )
+        with self.assertRaises(SessionNotEstablished):
+            client._establish_myaccount_session(self.ID_TOKEN)
+
+    def test_a_page_from_elsewhere_without_an_id_token_is_malformed(self):
+        client = self._login_page_without_an_id_token(
+            "https://myaccount.thameswater.co.uk/login?state=s"
+        )
+        with self.assertRaises(MalformedResponse) as caught:
+            client._establish_myaccount_session(self.ID_TOKEN)
+        self.assertNotIsInstance(caught.exception, SessionNotEstablished)
 
     def test_a_data_call_establishes_a_session_by_itself(self):
         client = self._client_for_ladder(

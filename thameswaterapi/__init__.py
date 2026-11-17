@@ -61,6 +61,15 @@ class MalformedResponse(Exception):
         )
 
 
+class SessionNotEstablished(MalformedResponse):
+    """Raised when B2C answers the myaccount sign-in with its sign-in page.
+
+    The refresh token outlives the B2C session that sign-in passes through,
+    so an id_token from it can still be turned away. :meth:`authenticate`
+    falls through to the next step on this alone.
+    """
+
+
 #: requests has no default timeout of its own, so every call sets one.
 DEFAULT_TIMEOUT = 30.0
 
@@ -902,8 +911,8 @@ class ThamesWater:
                 continue
             try:
                 self._establish_session(id_token)
-            except MalformedResponse as err:
-                _logger.debug("No session from the %s, falling through: %s", name, err)
+            except SessionNotEstablished as err:
+                _logger.info("No session from the %s, falling through: %s", name, err)
                 continue
             break
         else:
@@ -1008,6 +1017,8 @@ class ThamesWater:
             )
         state = unquote(query_params["state"][0])
         if "id='id_token' value='" not in r.text:
+            if urlparse(r.url).hostname == B2C_HOST:
+                raise SessionNotEstablished(r, "no id_token in the login page body")
             raise MalformedResponse(r, "no id_token in the login page body")
         new_id_token = r.text.split("id='id_token' value='")[1].split("'/>")[0]
 
