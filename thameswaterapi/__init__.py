@@ -916,6 +916,7 @@ class ThamesWater:
                 continue
             break
         else:
+            name = "password"
             self._establish_session(self._authenticate_with_password())
 
         if self._account_number is None:
@@ -925,6 +926,7 @@ class ThamesWater:
 
         self._authenticated = True
         self._visit_meter_page()
+        _logger.debug("Authenticated via %s", name)
 
     def _establish_session(self, id_token: str) -> None:
         """Establish the myaccount session for an id_token from the ladder."""
