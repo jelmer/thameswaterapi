@@ -359,8 +359,8 @@ def parse_meter_usage(data: dict) -> MeterUsage:
 def parse_token_response(data: dict) -> TokenResponse:
     """Parse a token endpoint response.
 
-    The endpoint returns a dozen MSAL telemetry and client_info fields that
-    nothing here reads, so the wanted ones are picked out rather than filtered.
+    The endpoint returns several fields that nothing here reads, so the
+    wanted ones are picked out rather than filtered.
     """
     if "error" in data:
         raise ValueError(
@@ -802,12 +802,7 @@ class ThamesWater:
             "redirect_uri": "https://www.thameswater.co.uk/login",
             "scope": "openid offline_access profile",
             "grant_type": "authorization_code",
-            "client_info": "1",
-            "x-client-SKU": "msal.js.browser",
-            "x-client-VER": "3.1.0",
             "x-ms-lib-capability": "retry-after, h429",
-            "x-client-current-telemetry": "5|865,0,,,|,",
-            "x-client-last-telemetry": "5|0|||0,0",
             "code_verifier": self.pkce_verifier,
             "code": confirmation_code,
         }
@@ -836,12 +831,7 @@ class ThamesWater:
             "client_id": self.client_id,
             "scope": scope,
             "grant_type": "refresh_token",
-            "client_info": "1",
-            "x-client-SKU": "msal.js.browser",
-            "x-client-VER": "3.1.0",
             "x-ms-lib-capability": "retry-after, h429",
-            "x-client-current-telemetry": "5|61,0,,,|@azure/msal-react,2.0.3",
-            "x-client-last-telemetry": "5|0|||0,0",
             "refresh_token": self._refresh_token,
         }
 

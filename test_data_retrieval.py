@@ -366,6 +366,16 @@ class TestRefreshTokenGrant(unittest.TestCase):
         self.assertEqual(data["grant_type"], "refresh_token")
         self.assertEqual(data["refresh_token"], "old-token")
 
+    def test_sends_no_made_up_browser_details(self):
+        client = self._client_with_token(
+            _response(body='{"id_token": "i", "refresh_token": "new-token"}')
+        )
+        client._refresh_token_grant()
+        data = client.s.request.call_args.kwargs["data"]
+        self.assertFalse([key for key in data if key.startswith("x-client")])
+        self.assertNotIn("client_info", data)
+        self.assertEqual(data["x-ms-lib-capability"], "retry-after, h429")
+
     def test_rotated_token_is_stored(self):
         client = self._client_with_token(
             _response(body='{"id_token": "i", "refresh_token": "new-token"}')
