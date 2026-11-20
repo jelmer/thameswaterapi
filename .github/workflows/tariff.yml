@@ -1,0 +1,34 @@
+name: Tariff
+
+on:
+  schedule:
+    # Ofwat requires the charges for the year starting 1 April to be
+    # published by 1 February, so one run then would technically do:
+    # https://www.ofwat.gov.uk/wp-content/uploads/2023/09/IN-2309-Information-notice-charging-information-requirements.pdf
+    # The help page can lag the published scheme, so this checks weekly until
+    # April in case it is late.
+    - cron: "17 6 * 2-4 1"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install .
+      - run: python scripts/check_tariff.py
+      - uses: peter-evans/create-pull-request@v8
+        with:
+          branch: tariff-update
+          title: Add the new charging year to the tariff table
+          commit-message: Add the new charging year to the tariff table
+          body: >
+            The help page now shows a charging year that is not in
+            `tariffs.csv`. Check the figures against the charges scheme
+            before merging.

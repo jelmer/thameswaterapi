@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import builtins
+import csv
 import datetime
 import enum
 import hashlib
@@ -106,6 +107,11 @@ TARIFF_URL = (
     "https://www.thameswater.co.uk/help/account-and-billing/"
     "understand-your-bill/metered-customers"
 )
+
+# Every published charging year, kept in this repository and read from its
+# main branch, so a new year reaches callers without a release. The help page
+# above only ever carries the current year.
+TARIFFS_URL = "https://raw.githubusercontent.com/jelmer/thameswaterapi/main/tariffs.csv"
 
 
 @dataclass
@@ -510,11 +516,25 @@ def get_tariff(
     session: requests.Session | None = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> Tariff:
-    """Fetch and parse the current metered-household tariff.
+    """Return the metered-household charges in force today (see :func:`get_tariffs`).
 
     Needs no authentication (the figures are region-wide), so it can be called
     without a :class:`ThamesWater` instance. A ``requests.Session`` may be
     passed to reuse an existing connection.
+    """
+    year = charging_year(datetime.datetime.now(tz=LONDON).date())
+    if (tariff := get_tariffs(session, timeout).get(year)) is None:
+        raise TariffError(f"No published charges for the year from 1 April {year}")
+    return tariff
+
+
+def get_published_tariff(
+    session: requests.Session | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> Tariff:
+    """Fetch and parse the charges on the help page.
+
+    The page carries the current year, or the next one once it is published.
     """
     getter = session.get if session is not None else requests.get
     try:
@@ -529,6 +549,55 @@ def get_tariff(
             f"Failed to fetch the Thames Water tariff page: {err}"
         ) from err
     return parse_tariff(r.text)
+
+
+def charging_year(day: datetime.date) -> int:
+    """Return the year the charging year containing ``day`` starts in.
+
+    Charges run from 1 April to 31 March.
+    """
+    return day.year if day >= datetime.date(day.year, 4, 1) else day.year - 1
+
+
+def parse_tariffs(text: str) -> dict[int, Tariff]:
+    """Parse ``tariffs.csv`` into each year's charges, keyed by its start year."""
+    try:
+        return {
+            int(row["charging_year"]): Tariff(
+                clean_water_rate_per_m3=float(row["clean_water_rate_per_m3"]),
+                wastewater_rate_per_m3=float(row["wastewater_rate_per_m3"]),
+                water_fixed_per_year=float(row["water_fixed_per_year"]),
+                wastewater_fixed_per_year=float(row["wastewater_fixed_per_year"]),
+                effective_date=datetime.date(int(row["charging_year"]), 4, 1),
+            )
+            for row in csv.DictReader(text.splitlines())
+        }
+    except (KeyError, TypeError, ValueError) as err:
+        raise TariffError(f"Could not parse the tariff table: {err}") from err
+
+
+def get_tariffs(
+    session: requests.Session | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> dict[int, Tariff]:
+    """Fetch the charges of every published year, keyed by its start year.
+
+    Pick a day's charges with :func:`charging_year`. They come from the table
+    of published years, and the help page fills in the current year while it
+    is missing from the table, or the table cannot be fetched.
+    """
+    getter = session.get if session is not None else requests.get
+    try:
+        r = getter(TARIFFS_URL, timeout=timeout)
+        r.raise_for_status()
+        tariffs = parse_tariffs(r.text)
+    except (requests.RequestException, TariffError) as err:
+        _logger.debug("Could not read the tariff table: %s", err)
+        tariffs = {}
+    if charging_year(datetime.datetime.now(tz=LONDON).date()) not in tariffs:
+        published = get_published_tariff(session, timeout)
+        tariffs.setdefault(charging_year(published.effective_date), published)
+    return tariffs
 
 
 def parse_meters_response(data: dict) -> MetersResponse:
