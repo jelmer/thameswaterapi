@@ -358,10 +358,29 @@ def _filter_known_fields(cls: type, data: dict) -> dict:
     return {k: v for k, v in data.items() if k in known}
 
 
+def _build_all(cls: type[T], items: list[dict] | None) -> list[T]:
+    """Build one dataclass per dict, ignoring fields the dataclass lacks.
+
+    Unknown fields are reported once per call, not once per item, so a field
+    added to every line of a response produces one warning rather than one
+    per line.
+    """
+    items = items or []
+    known = {f.name for f in fields(cls)}  # type: ignore[arg-type]
+    unknown = set().union(*(item.keys() for item in items)) - known
+    if unknown:
+        _logger.warning(
+            "Unknown fields in %s response: %s",
+            cls.__name__,
+            ", ".join(sorted(unknown)),
+        )
+    return [cls(**{k: v for k, v in item.items() if k in known}) for item in items]
+
+
 def parse_meter_usage(data: dict) -> MeterUsage:
     """Parse a raw JSON dict from the meter usage API into a MeterUsage object."""
     data = dict(data)
-    data["Lines"] = [Line(**line) for line in data["Lines"] or []]
+    data["Lines"] = _build_all(Line, data["Lines"])
     return MeterUsage(**_filter_known_fields(MeterUsage, data))
 
 
@@ -543,11 +562,11 @@ def get_tariff(
 def parse_meters_response(data: dict) -> MetersResponse:
     """Parse a raw JSON dict from the getMeters API into a MetersResponse object."""
     data = dict(data)
-    data["Lines"] = [Line(**line) for line in data["Lines"] or []]
-    data["Yearly"] = [DateRangeKey(**k) for k in data.get("Yearly") or []]
-    data["HalfYearly"] = [DateRangeKey(**k) for k in data.get("HalfYearly") or []]
-    data["Monthly"] = [DateRangeKey(**k) for k in data.get("Monthly") or []]
-    data["Daily"] = [DateRangeKey(**k) for k in data.get("Daily") or []]
+    data["Lines"] = _build_all(Line, data["Lines"])
+    data["Yearly"] = _build_all(DateRangeKey, data.get("Yearly"))
+    data["HalfYearly"] = _build_all(DateRangeKey, data.get("HalfYearly"))
+    data["Monthly"] = _build_all(DateRangeKey, data.get("Monthly"))
+    data["Daily"] = _build_all(DateRangeKey, data.get("Daily"))
     return MetersResponse(**_filter_known_fields(MetersResponse, data))
 
 
