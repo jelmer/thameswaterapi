@@ -345,9 +345,14 @@ def _parse_retry_after(header: str | None) -> int | None:
         return None
 
 
-def _filter_known_fields(cls: type, data: dict) -> dict:
-    """Filter a dict to only known dataclass fields, warning about unknown ones."""
-    known = {f.name for f in fields(cls)}
+def _build(cls: type[T], data: dict) -> T:
+    """Construct a dataclass from a dict, dropping fields the dataclass lacks.
+
+    Thames Water adds fields to responses without warning (e.g. a per-line
+    ``continuousFlow`` appeared in November 2026); tolerating unknown keys
+    keeps parsing working until the dataclass catches up.
+    """
+    known = {f.name for f in fields(cls)}  # type: ignore[arg-type]
     unknown = data.keys() - known
     if unknown:
         _logger.warning(
@@ -355,14 +360,14 @@ def _filter_known_fields(cls: type, data: dict) -> dict:
             cls.__name__,
             ", ".join(sorted(unknown)),
         )
-    return {k: v for k, v in data.items() if k in known}
+    return cls(**{k: v for k, v in data.items() if k in known})
 
 
 def parse_meter_usage(data: dict) -> MeterUsage:
     """Parse a raw JSON dict from the meter usage API into a MeterUsage object."""
     data = dict(data)
-    data["Lines"] = [Line(**line) for line in data["Lines"] or []]
-    return MeterUsage(**_filter_known_fields(MeterUsage, data))
+    data["Lines"] = [_build(Line, line) for line in data.get("Lines") or []]
+    return _build(MeterUsage, data)
 
 
 def parse_token_response(data: dict) -> TokenResponse:
@@ -418,7 +423,7 @@ def _parse_access_token_response(data: dict) -> TokenResponse:
 def _parse_address(data: dict | None) -> Address | None:
     if data is None:
         return None
-    return Address(**_filter_known_fields(Address, data))
+    return _build(Address, data)
 
 
 def parse_account(data: dict) -> Account:
@@ -426,28 +431,22 @@ def parse_account(data: dict) -> Account:
     data = dict(data)
 
     if (holder := data.get("primaryAccountHolder")) is not None:
-        data["primaryAccountHolder"] = PrimaryAccountHolder(
-            **_filter_known_fields(PrimaryAccountHolder, holder)
-        )
+        data["primaryAccountHolder"] = _build(PrimaryAccountHolder, holder)
 
     if (prop := data.get("property")) is not None:
         prop = dict(prop)
         prop["address"] = _parse_address(prop.get("address"))
-        data["property"] = Property(**_filter_known_fields(Property, prop))
+        data["property"] = _build(Property, prop)
 
     if (contact := data.get("contactDetails")) is not None:
-        data["contactDetails"] = ContactDetails(
-            **_filter_known_fields(ContactDetails, contact)
-        )
+        data["contactDetails"] = _build(ContactDetails, contact)
 
     if (corr := data.get("correspondence")) is not None:
         corr = dict(corr)
         corr["address"] = _parse_address(corr.get("address"))
-        data["correspondence"] = Correspondence(
-            **_filter_known_fields(Correspondence, corr)
-        )
+        data["correspondence"] = _build(Correspondence, corr)
 
-    return Account(**_filter_known_fields(Account, data))
+    return _build(Account, data)
 
 
 def _search_tariff_float(pattern: str, text: str, description: str) -> float:
@@ -543,12 +542,10 @@ def get_tariff(
 def parse_meters_response(data: dict) -> MetersResponse:
     """Parse a raw JSON dict from the getMeters API into a MetersResponse object."""
     data = dict(data)
-    data["Lines"] = [Line(**line) for line in data["Lines"] or []]
-    data["Yearly"] = [DateRangeKey(**k) for k in data.get("Yearly") or []]
-    data["HalfYearly"] = [DateRangeKey(**k) for k in data.get("HalfYearly") or []]
-    data["Monthly"] = [DateRangeKey(**k) for k in data.get("Monthly") or []]
-    data["Daily"] = [DateRangeKey(**k) for k in data.get("Daily") or []]
-    return MetersResponse(**_filter_known_fields(MetersResponse, data))
+    data["Lines"] = [_build(Line, line) for line in data.get("Lines") or []]
+    for key in ("Yearly", "HalfYearly", "Monthly", "Daily"):
+        data[key] = [_build(DateRangeKey, item) for item in data.get(key) or []]
+    return _build(MetersResponse, data)
 
 
 def _decode_jwt_payload(token: str) -> dict:
