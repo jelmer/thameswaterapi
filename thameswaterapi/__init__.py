@@ -937,15 +937,22 @@ class ThamesWater:
     def _authenticate_silently(self) -> str | None:
         """Return an id_token from a live B2C session, or None to fall through.
 
-        prompt=none answers with an id_token while a session cookie is still
-        live and with error=interaction_required (AADB2C90077) once it is not.
+        prompt=none answers with a code while a session cookie is still live
+        and with error=interaction_required (AADB2C90077) once it is not.
+
+        It asks for a code rather than an id_token so that the exchange also
+        replaces the refresh token: this step runs after the held one was
+        rejected, and get_account needs a refresh token that still works.
         """
+        self._generate_pkce()
         params = {
             "client_id": self.client_id,
-            "scope": "openid profile",
-            "response_type": "id_token",
+            "scope": "openid profile offline_access",
+            "response_type": "code",
             "redirect_uri": "https://www.thameswater.co.uk/login",
             "response_mode": "fragment",
+            "code_challenge": self.pkce_challenge,
+            "code_challenge_method": "S256",
             "prompt": "none",
             "nonce": str(uuid.uuid4()),
             "state": str(uuid.uuid4()),
@@ -957,8 +964,12 @@ class ThamesWater:
 
         location = r.headers.get("Location", "")
         fragment_params = parse_qs(urlparse(location).fragment)
-        if "id_token" in fragment_params:
-            return fragment_params["id_token"][0]
+        if "code" in fragment_params:
+            tokens = self._get_oauth2_code_b2c_1_tw_website_signin(
+                fragment_params["code"][0]
+            )
+            assert tokens.id_token is not None  # _parse_id_token_response guarantees it
+            return tokens.id_token
         if "error" in fragment_params:
             _logger.debug(
                 "Silent authorize declined, falling through: %s",
@@ -967,8 +978,7 @@ class ThamesWater:
             return None
         raise MalformedResponse(
             r,
-            "no id_token and no error in the redirect fragment; "
-            f"Location was {location!r}",
+            f"no code and no error in the redirect fragment; Location was {location!r}",
         )
 
     def _authenticate_with_password(self) -> str:
