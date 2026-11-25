@@ -374,6 +374,13 @@ class TestLogout(unittest.TestCase):
         client.authenticate.assert_called_once()
 
 
+class TestClose(unittest.TestCase):
+    def test_closes_the_http_session(self):
+        client = _client()
+        client.close()
+        client.s.close.assert_called_once_with()
+
+
 class TestRefreshTokenGrant(unittest.TestCase):
     def _client_with_token(self, *responses):
         client = _client(*responses)
