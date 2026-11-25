@@ -235,17 +235,17 @@ class TestDeserializeMetersResponse(unittest.TestCase):
         self.assertIn("SomeNewField", cm.output[0])
 
     def test_unknown_line_fields_ignored(self):
-        # Thames Water began sending "continuousFlow" on every usage line in
-        # November 2026; a new per-line field must not reject the response.
+        # Thames Water adds per-line fields without warning (continuousFlow
+        # appeared in November 2026); a new one must not reject the response.
         data = dict(self.SAMPLE_JSON)
-        data["Lines"] = [dict(line, continuousFlow=0) for line in data["Lines"]]
+        data["Lines"] = [dict(line, NewLineField=0) for line in data["Lines"]]
         data["Daily"] = [dict(k, Extra=1) for k in data["Daily"]]
         with self.assertLogs("thameswaterapi", level="WARNING") as cm:
             result = self._parse(data)
         self.assertEqual(len(result.Lines), 2)
         self.assertEqual(result.Lines[1].Read, 22232.5)
         self.assertEqual(result.Daily[0].Value, "02-03-2026")
-        self.assertTrue(any("continuousFlow" in o for o in cm.output))
+        self.assertTrue(any("NewLineField" in o for o in cm.output))
         self.assertTrue(any("Extra" in o for o in cm.output))
 
 
@@ -319,15 +319,15 @@ class TestDeserializeMeterUsage(unittest.TestCase):
         self.assertIn("BrandNewField", cm.output[0])
 
     def test_unknown_line_fields_ignored(self):
-        # Thames Water began sending "continuousFlow" on every usage line in
-        # November 2026; a new per-line field must not reject the response.
+        # Thames Water adds per-line fields without warning (continuousFlow
+        # appeared in November 2026); a new one must not reject the response.
         data = dict(self.SAMPLE_JSON)
-        data["Lines"] = [dict(line, continuousFlow=0) for line in data["Lines"]]
+        data["Lines"] = [dict(line, NewLineField=0) for line in data["Lines"]]
         with self.assertLogs("thameswaterapi", level="WARNING") as cm:
             result = self._parse(data)
         self.assertEqual(len(result.Lines), 2)
         self.assertEqual(result.Lines[1].Read, 25445.0)
-        self.assertTrue(any("continuousFlow" in o for o in cm.output))
+        self.assertTrue(any("NewLineField" in o for o in cm.output))
 
 
 class TestDecodeJwtPayload(unittest.TestCase):

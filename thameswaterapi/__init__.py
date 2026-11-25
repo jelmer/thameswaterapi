@@ -124,6 +124,7 @@ class Line:
     Read: float
     IsEstimated: bool
     MeterSerialNumberHis: str
+    continuousFlow: int | None = None
 
 
 @dataclass
