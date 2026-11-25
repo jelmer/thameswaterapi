@@ -459,14 +459,17 @@ class TestAuthenticationLadder(unittest.TestCase):
     def test_a_spent_refresh_token_falls_through_to_silent_authorize(self):
         client = self._client_for_ladder(
             _response(status=400, body='{"error": "invalid_grant"}'),
+            _response(status=302, headers={"Location": "https://x/#code=c"}),
             _response(
-                status=302,
-                headers={"Location": f"https://x/#id_token={self.ID_TOKEN}"},
+                body=json.dumps({"id_token": self.ID_TOKEN, "refresh_token": "r2"})
             ),
         )
         client._refresh_token = "spent"
         client.authenticate()
         client._authenticate_with_password.assert_not_called()
+        # get_account trades the refresh token, so the spent one must not
+        # outlive the step that recovered.
+        self.assertEqual(client.refresh_token, "r2")
 
     def test_no_live_session_falls_through_to_the_password(self):
         client = self._client_for_ladder(
@@ -488,7 +491,7 @@ class TestAuthenticationLadder(unittest.TestCase):
         client.authenticate()
         call = client.s.request.call_args_list[0]
         self.assertEqual(call.kwargs["params"]["prompt"], "none")
-        self.assertEqual(call.kwargs["params"]["response_type"], "id_token")
+        self.assertEqual(call.kwargs["params"]["response_type"], "code")
         self.assertFalse(call.kwargs["allow_redirects"])
 
     def test_an_unrecognisable_silent_authorize_answer_is_malformed(self):
@@ -533,10 +536,10 @@ class TestAuthenticationLadder(unittest.TestCase):
 
     def test_a_session_silent_authorize_cannot_establish_falls_through(self):
         client = self._client_for_ladder(
+            _response(status=302, headers={"Location": "https://x/#code=c"}),
             _response(
-                status=302,
-                headers={"Location": f"https://x/#id_token={self.ID_TOKEN}"},
-            )
+                body=json.dumps({"id_token": self.ID_TOKEN, "refresh_token": "r2"})
+            ),
         )
         client._establish_myaccount_session.side_effect = [
             SessionNotEstablished(_response(), "no id_token in the login page body"),
