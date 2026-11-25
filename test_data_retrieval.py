@@ -262,6 +262,7 @@ class TestDeserializeMeterUsage(unittest.TestCase):
                 "Read": 25435.0,
                 "IsEstimated": False,
                 "MeterSerialNumberHis": "100000001",
+                "continuousFlow": 0,
             },
             {
                 "Label": "1:00",
@@ -301,8 +302,10 @@ class TestDeserializeMeterUsage(unittest.TestCase):
         self.assertEqual(result.Lines[0].Label, "0:00")
         self.assertEqual(result.Lines[0].Usage, 0.0)
         self.assertEqual(result.Lines[0].Read, 25435.0)
+        self.assertEqual(result.Lines[0].continuousFlow, 0)
         self.assertEqual(result.Lines[1].Label, "1:00")
         self.assertEqual(result.Lines[1].Usage, 10.0)
+        self.assertIsNone(result.Lines[1].continuousFlow)
 
     def test_null_lines(self):
         data = dict(self.SAMPLE_JSON)
@@ -492,6 +495,11 @@ class TestAuthenticationLadder(unittest.TestCase):
         call = client.s.request.call_args_list[0]
         self.assertEqual(call.kwargs["params"]["prompt"], "none")
         self.assertEqual(call.kwargs["params"]["response_type"], "code")
+        self.assertEqual(
+            call.kwargs["params"]["scope"], "openid profile offline_access"
+        )
+        self.assertEqual(call.kwargs["params"]["code_challenge_method"], "S256")
+        self.assertEqual(call.kwargs["params"]["code_challenge"], client.pkce_challenge)
         self.assertFalse(call.kwargs["allow_redirects"])
 
     def test_an_unrecognisable_silent_authorize_answer_is_malformed(self):
