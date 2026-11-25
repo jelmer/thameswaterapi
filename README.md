@@ -55,6 +55,7 @@ store(thames_water.refresh_token)  # rotated, so store it after every cycle
 store(thames_water.cookies)
 
 thames_water.logout()  # ends the session server-side
+thames_water.close()  # releases the HTTP connections; sends nothing
 ```
 
 ### Listing accounts and meters

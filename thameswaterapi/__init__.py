@@ -604,6 +604,14 @@ class ThamesWater:
                 path=cookie.get("path", "/"),
             )
 
+    def close(self) -> None:
+        """Release the HTTP connections the client holds.
+
+        Nothing is sent: the server-side session survives, unlike :meth:`logout`.
+        A later call opens new connections, so stop calling the client first.
+        """
+        self.s.close()
+
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Issue a request with the client timeout and classify the outcome.
 
