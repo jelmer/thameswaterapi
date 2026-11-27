@@ -10,7 +10,7 @@ maintainers = [
 ]
 license = "MIT"
 readme = "README.md"
-requires-python = ">=3.9,<4.0"
+requires-python = ">=3.10,<4.0"
 dependencies = [
     "requests>=2.31.0",
     # Windows ships no zone database, and readings are timestamped in

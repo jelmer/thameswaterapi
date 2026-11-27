@@ -346,20 +346,29 @@ def _parse_retry_after(header: str | None) -> int | None:
         return None
 
 
+# (class name, field) pairs already reported by _build, so that a field on
+# every line of every poll is logged once per process rather than once per
+# line per poll.
+_reported_unknown_fields: set[tuple[str, str]] = set()
+
+
 def _build(cls: type[T], data: dict) -> T:
     """Construct a dataclass from a dict, dropping fields the dataclass lacks.
 
     Thames Water adds fields to responses without warning (e.g. a per-line
     ``continuousFlow`` appeared in November 2026); tolerating unknown keys
-    keeps parsing working until the dataclass catches up.
+    keeps parsing working until the dataclass catches up. Each unknown field
+    is reported once per class, the first time it is seen.
     """
     known = {f.name for f in fields(cls)}  # type: ignore[arg-type]
     unknown = data.keys() - known
-    if unknown:
+    new = {(cls.__name__, k) for k in unknown} - _reported_unknown_fields
+    if new:
+        _reported_unknown_fields.update(new)
         _logger.warning(
             "Unknown fields in %s response: %s",
             cls.__name__,
-            ", ".join(sorted(unknown)),
+            ", ".join(sorted(k for _, k in new)),
         )
     return cls(**{k: v for k, v in data.items() if k in known})
 
