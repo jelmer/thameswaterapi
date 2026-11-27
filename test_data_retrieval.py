@@ -9,6 +9,7 @@ from unittest import mock
 
 import requests
 
+import thameswaterapi
 from thameswaterapi import (
     B2C_HOST,
     END_SESSION_ENDPOINT,
@@ -55,6 +56,15 @@ def _client(*responses: requests.Response) -> ThamesWater:
     else:
         client.s.request.side_effect = responses
     return client
+
+
+class _FreshUnknownFieldWarnings(unittest.TestCase):
+    """Forget which unknown fields were already reported, before each test."""
+
+    def setUp(self):
+        super().setUp()
+        thameswaterapi._reported_unknown_fields.clear()
+        self.addCleanup(thameswaterapi._reported_unknown_fields.clear)
 
 
 class TestRequestClassification(unittest.TestCase):
@@ -133,7 +143,7 @@ class TestRequestClassification(unittest.TestCase):
         self.assertEqual(len(cm.exception.body), MalformedResponse.BODY_SNIPPET_LEN)
 
 
-class TestDeserializeMetersResponse(unittest.TestCase):
+class TestDeserializeMetersResponse(_FreshUnknownFieldWarnings):
     """Test that raw JSON from getMeters is correctly deserialized."""
 
     SAMPLE_JSON: ClassVar[dict] = {
@@ -249,7 +259,7 @@ class TestDeserializeMetersResponse(unittest.TestCase):
         self.assertTrue(any("Extra" in o for o in cm.output))
 
 
-class TestDeserializeMeterUsage(unittest.TestCase):
+class TestDeserializeMeterUsage(_FreshUnknownFieldWarnings):
     """Test that raw JSON from getSmartWaterMeterConsumptions is correctly deserialized."""
 
     SAMPLE_JSON: ClassVar[dict] = {
@@ -331,6 +341,41 @@ class TestDeserializeMeterUsage(unittest.TestCase):
         self.assertEqual(len(result.Lines), 2)
         self.assertEqual(result.Lines[1].Read, 25445.0)
         self.assertTrue(any("NewLineField" in o for o in cm.output))
+
+    def test_unknown_line_field_warned_once_per_response(self):
+        # A field on every line used to log once per line: 128 warnings for a
+        # five-day fetch, enough for Home Assistant to flag the logger.
+        data = dict(self.SAMPLE_JSON)
+        data["Lines"] = [dict(line, NewLineField=0) for line in data["Lines"]]
+        with self.assertLogs("thameswaterapi", level="WARNING") as cm:
+            self._parse(data)
+        self.assertEqual(
+            cm.output,
+            ["WARNING:thameswaterapi:Unknown fields in Line response: NewLineField"],
+        )
+
+    def test_unknown_field_not_reported_again(self):
+        # Polling repeats the same response shape; once is enough.
+        data = dict(self.SAMPLE_JSON)
+        data["Lines"] = [dict(line, NewLineField=0) for line in data["Lines"]]
+        with self.assertLogs("thameswaterapi", level="WARNING"):
+            self._parse(data)
+        with self.assertNoLogs("thameswaterapi", level="WARNING"):
+            result = self._parse(data)
+        self.assertEqual(len(result.Lines), 2)
+
+    def test_a_later_unknown_field_is_still_reported(self):
+        data = dict(self.SAMPLE_JSON)
+        data["Lines"] = [dict(line, NewLineField=0) for line in data["Lines"]]
+        with self.assertLogs("thameswaterapi", level="WARNING"):
+            self._parse(data)
+        data["Lines"] = [dict(line, OtherField=1) for line in data["Lines"]]
+        with self.assertLogs("thameswaterapi", level="WARNING") as cm:
+            self._parse(data)
+        self.assertEqual(
+            cm.output,
+            ["WARNING:thameswaterapi:Unknown fields in Line response: OtherField"],
+        )
 
 
 class TestDecodeJwtPayload(unittest.TestCase):
@@ -1011,7 +1056,7 @@ class TestMeterUsageLinesToTimeseries(unittest.TestCase):
             )
 
 
-class TestParseAccount(unittest.TestCase):
+class TestParseAccount(_FreshUnknownFieldWarnings):
     """Test parsing of the account-management-api /Accounts response."""
 
     SAMPLE_JSON: ClassVar[dict] = {
