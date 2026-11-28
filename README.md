@@ -123,6 +123,25 @@ tariff.standing_charge_per_day  # combined fixed charge GBP/day
 `ThamesWater.get_tariff()` is also available on an authenticated client (it
 reuses the session).
 
+The page only carries the current year. `get_tariffs()` returns every published
+year, keyed by the year its charges start in, so a reading can be priced at the
+rate in force on its day:
+
+```python
+import datetime
+
+from thameswaterapi import charging_year, get_tariffs
+
+tariffs = get_tariffs()
+year = charging_year(datetime.date(2025, 3, 31))  # 2024
+tariffs[year].clean_water_rate_per_m3  # 1.9145
+```
+
+The years live in `tariffs.csv` in this repository and are read from its main
+branch, so a new year needs no release. The help page is only read while the
+current year is missing from the table. A scheduled workflow opens a pull
+request adding each new year once the help page shows it.
+
 ## Command line
 
 ```
